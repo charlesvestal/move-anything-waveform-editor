@@ -1,0 +1,87 @@
+{
+  "title": "Waveform Editor",
+  "children": [
+    {
+      "title": "Overview",
+      "lines": [
+        "Edit WAV files on",
+        "your Move. Trim,",
+        "adjust gain, mute,",
+        "copy/paste, and",
+        "normalize audio.",
+        "",
+        "Waveform display with",
+        "zoom and minimap.",
+        "Undo support for all",
+        "destructive edits."
+      ]
+    },
+    {
+      "title": "Navigation",
+      "lines": [
+        "Jog: move selected",
+        "  marker (start/end)",
+        "Jog click: toggle",
+        "  between start and",
+        "  end markers",
+        "",
+        "E1 (Knob 1): move",
+        "  start marker",
+        "E2 (Knob 2): move",
+        "  end marker",
+        "E3 (Knob 3): zoom",
+        "  Shift: vertical",
+        "  scale (1x-32x)"
+      ]
+    },
+    {
+      "title": "Editing",
+      "lines": [
+        "E4 (Knob 4): gain",
+        "  Shift: normalize",
+        "",
+        "Mute: zero selection",
+        "Copy: copy selection",
+        "Shift+Copy: paste",
+        "  (insert at cursor)",
+        "Delete: cut selection",
+        "  (copy + remove)",
+        "",
+        "Undo: undo last edit",
+        "All edits reversible."
+      ]
+    },
+    {
+      "title": "Playback",
+      "lines": [
+        "Any pad: hold to",
+        "  audition selection",
+        "  release to stop",
+        "",
+        "Shift+Pad: play",
+        "  entire file",
+        "",
+        "Loop button: toggle",
+        "  loop mode on/off",
+        "",
+        "Header shows:",
+        " * = unsaved changes",
+        " L = loop enabled"
+      ]
+    },
+    {
+      "title": "Saving",
+      "lines": [
+        "Capture: save file",
+        "  (overwrite confirm)",
+        "",
+        "Shift+Capture: export",
+        "  selection to a",
+        "  new file",
+        "",
+        "Back: exit (warns if",
+        "  unsaved changes)"
+      ]
+    }
+  ]
+}

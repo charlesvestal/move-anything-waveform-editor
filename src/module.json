@@ -1,0 +1,15 @@
+{
+    "id": "waveform-editor",
+    "name": "Waveform Editor",
+    "version": "0.1.0",
+    "description": "Trim, gain adjust, and edit audio files on the Move",
+    "author": "Move Anything",
+    "dsp": "dsp.so",
+    "api_version": 2,
+    "component_type": "tool",
+    "tool_config": {
+        "interactive": true,
+        "command": null,
+        "input_extensions": [".wav"]
+    }
+}

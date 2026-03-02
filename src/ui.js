@@ -1,0 +1,1942 @@
+/*
+ * Waveform Editor UI
+ *
+ * Trim, gain adjust, normalize, and edit audio files on the Move.
+ * 128x64 1-bit monochrome display, QuickJS runtime.
+ *
+ * Views: Mode Menu, Editor, Confirm Exit, Confirm Normalize
+ *
+ * Header indicators: "*" = unsaved changes, "L" = loop enabled
+ * Zoom minimap bar shows viewport position when zoomed in
+ *
+ * Encoder handling: The shadow UI framework batches encoder ticks
+ * per-knob and delivers one synthetic CC per frame with accumulated
+ * count. decodeDelta() returns the signed count for proportional response.
+ *
+ * Controls:
+ *   Jog wheel    - Move selected marker  |  Menu: navigate
+ *   Jog click    - Toggle start/end field |  Menu: select item
+ *   E1 (Knob 1)  - Move start marker
+ *   E2 (Knob 2)  - Move end marker
+ *   E3 (Knob 3)  - Zoom in/out  |  Shift: vertical scale (1x-32x)
+ *   E4 (Knob 4)  - Adjust gain  |  Shift: normalize (confirm overlay)
+ *   Any pad      - Hold to audition, release to stop (shift = play whole file)
+ *   Mute         - Mute (zero out) selection
+ *   Copy         - Copy selection to clipboard
+ *   Shift+Copy   - Paste clipboard at cursor (insert)
+ *   Delete       - Cut selection to clipboard (copy + remove)
+ *   Shift+Capture- Export selection to new file
+ *   Capture      - Save (overwrite confirmation)
+ *   Undo         - Undo last destructive operation
+ *   Loop         - Toggle loop mode
+ *   Back         - Navigate back / exit
+ */
+
+import * as os from 'os';
+
+/* Shared utilities - absolute path for module location independence */
+import {
+    MidiNoteOn, MidiCC,
+    MoveShift, MoveMainKnob, MoveMainButton, MoveBack,
+    MoveCapture, MoveUndo, MoveLoop, MoveCopy, MoveMute, MoveDelete,
+    MovePads,
+    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4,
+    White, Black, DarkGrey, LightGrey,
+    WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright
+} from '/data/UserData/move-anything/shared/constants.mjs';
+
+import {
+    setLED, setButtonLED, decodeDelta
+} from '/data/UserData/move-anything/shared/input_filter.mjs';
+
+import {
+    buildFilepathBrowserState,
+    refreshFilepathBrowser,
+    moveFilepathBrowserSelection,
+    activateFilepathBrowserItem
+} from '/data/UserData/move-anything/shared/filepath_browser.mjs';
+
+/* ============ Constants ============ */
+
+/* Views */
+var VIEW_MODE_MENU = 1;
+var VIEW_TRIM = 2;
+var VIEW_CONFIRM_EXIT = 4;
+var VIEW_CONFIRM_NORMALIZE = 5;
+var VIEW_LOOP = 6;
+var VIEW_CONFIRM_SAVE = 7;
+var VIEW_OPEN_FILE = 8;
+
+/* MIDI CCs — use shared constants */
+var CC_JOG = MoveMainKnob;
+var CC_JOG_CLICK = MoveMainButton;
+var CC_E1 = MoveKnob1;
+var CC_E2 = MoveKnob2;
+var CC_E3 = MoveKnob3;
+var CC_E4 = MoveKnob4;
+var CC_SHIFT = MoveShift;
+var CC_BACK = MoveBack;
+var CC_MUTE = MoveMute;
+var CC_DELETE = MoveDelete;
+var CC_COPY = MoveCopy;
+var CC_UNDO = MoveUndo;
+var CC_LOOP = MoveLoop;
+var CC_CAPTURE = MoveCapture;
+
+/* Pad note range */
+var PAD_NOTE_MIN = MovePads[0];
+var PAD_NOTE_MAX = MovePads[MovePads.length - 1];
+
+/* Display geometry */
+var SCREEN_W = 128;
+var SCREEN_H = 64;
+var WAVE_Y_TOP = 13;
+var WAVE_Y_BOT = 50;
+var WAVE_HEIGHT = WAVE_Y_BOT - WAVE_Y_TOP;
+var WAVE_MID = WAVE_Y_TOP + Math.floor(WAVE_HEIGHT / 2);
+
+/* Gain limits */
+var GAIN_MIN = -60.0;
+var GAIN_MAX = 24.0;
+var GAIN_STEP = 0.5;
+
+/* Zoom limits — float zoom, small step per encoder tick for smooth zooming */
+var ZOOM_MAX = 12;
+var ZOOM_STEP = 0.1;
+
+/* Vertical scale: multiplier for waveform display amplitude */
+var VSCALE_MIN = 1.0;
+var VSCALE_MAX = 32.0;
+var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
+
+/* ============ State ============ */
+
+var currentView = VIEW_TRIM;
+var shiftHeld = false;
+
+/* File info */
+var fileName = "";
+var fileDuration = 0;
+var totalFrames = 0;
+var sampleRate = 44100;
+
+/* Marker state */
+var startSample = 0;
+var endSample = 0;
+var selectedField = 0; /* 0=start, 1=end */
+
+/* Zoom state */
+var zoomLevel = 0;
+var zoomCenter = 0;
+
+/* Vertical scale state */
+var vScale = 1.0;
+
+/* Playback state — play/stop commands are queued and issued in tick()
+ * to avoid being overwritten by encoder param updates (fire-and-forget
+ * shared memory race). Pads always win. */
+var playing = false;
+var playPos = 0;
+var pendingPlay = "";  /* "", "selection", "whole", or "stop" */
+var activePadNote = -1; /* Which pad note owns current playback */
+
+/* Gain state */
+var gainDb = 0.0;
+var peakDb = -100.0;
+
+/* Waveform cache — only re-fetch when visible range changes */
+var waveformData = null; /* Array of [min, max] pairs, length 128 */
+var cachedVisStart = -1;
+var cachedVisEnd = -1;
+var waveformDirty = true; /* Force fetch on first draw */
+
+/* Seam waveform cache (loop mode) */
+var seamZoomLevel = 4;
+var SEAM_ZOOM_STEP = 0.2;
+var seamWaveformData = null;
+var seamWaveformDirty = true;
+var cachedSeamStart = -1;
+var cachedSeamEnd = -1;
+var cachedSeamHalf = -1;
+
+/* Loop view selected field: 0=start (loop point), 1=end */
+var loopSelectedField = 0;
+
+/* Mode menu */
+var menuItems = ["Edit", "Loop", "Open File", "Exit Editor"];
+var menuIndex = 0;
+
+/* Open File browser state */
+var openFileBrowserState = null;
+var OPEN_FILE_FS = {
+    readdir: function(path) {
+        var entries = os.readdir(path) || [];
+        if (Array.isArray(entries[0])) return entries[0];
+        return Array.isArray(entries) ? entries : [];
+    },
+    stat: function(path) {
+        return os.stat(path);
+    }
+};
+
+/* Confirm exit menu */
+var confirmItems = ["Save & Exit", "Discard", "Cancel"];
+var confirmIndex = 0;
+
+/* Confirm normalize overlay */
+var normalizeItems = ["Normalize", "Cancel"];
+var normalizeIndex = 0;
+
+/* Confirm save overlay */
+var saveItems = ["Overwrite", "Cancel"];
+var saveIndex = 0;
+var saveReturnView = VIEW_TRIM; /* View to return to after save/cancel */
+
+/* Loop state */
+var loopEnabled = false;
+
+/* Undo state */
+var hasUndo = false;
+
+/* Clipboard state */
+var hasClipboard = false;
+
+/* Dirty flag */
+var dirty = false;
+
+/* Status message — two modes:
+ * 1. Knob-held: persists while knob is touched, per-knob messages
+ * 2. Timed: decays after N frames (for button actions like trim, save) */
+var statusMsg = "";
+var statusTimer = 0;
+
+/* Knob touch tracking — notes 0-7 for knobs 1-8 */
+var TOUCH_NOTE_MIN = 0;
+var TOUCH_NOTE_MAX = 7;
+var knobTouched = [false, false, false, false, false, false, false, false];
+var knobStatusMsg = ["", "", "", "", "", "", "", ""];
+var knobTouchOrder = []; /* Stack of touched knob indices, most recent last */
+
+/* Jog "virtual touch" — no hardware touch note, so decay on a timer.
+ * Each jog turn resets the timer. Participates in the same priority
+ * system as knob touches via a special JOG_ID sentinel. */
+var JOG_ID = -1;
+var jogStatusMsg = "";
+var jogHeldTimer = 0;
+var JOG_HOLD_FRAMES = 30; /* ~1 second at 30fps */
+
+/* ============ Encoder Helpers ============ */
+/*
+ * The shadow UI framework batches encoder CCs and delivers one synthetic
+ * message per knob per frame. The CC value encodes the accumulated tick
+ * count: CW = count (1-63), CCW = 128 - abs(count) (65-127).
+ * decodeDelta() extracts the signed count for direct use as a multiplier.
+ */
+
+/* ============ LED Helpers ============ */
+
+/* White LED brightness levels — use shared constants */
+var LED_OFF = WhiteLedOff;
+var LED_DIM = WhiteLedDim;
+var LED_MED = WhiteLedMedium;
+var LED_BRIGHT = WhiteLedBright;
+
+/* RGB pad colors */
+var PAD_COLOR_DIM = DarkGrey;
+var PAD_COLOR_PLAY = White;
+
+/* Progressive LED init state */
+var ledInitPending = true;
+var ledInitIndex = 0;
+var LEDS_PER_FRAME = 8;
+
+/**
+ * Initialize LEDs progressively (avoid buffer overflow).
+ * Lights up buttons with functions and pads for audition.
+ */
+function initLedsStep() {
+    if (!ledInitPending) return;
+
+    var commands = [];
+
+    /* Button LEDs — dim to show they're active */
+    commands.push(function() { setButtonLED(CC_MUTE, LED_DIM); });
+    commands.push(function() { setButtonLED(CC_DELETE, LED_DIM); });
+    commands.push(function() { setButtonLED(CC_COPY, LED_DIM); });
+    commands.push(function() { setButtonLED(CC_UNDO, LED_DIM); });
+    commands.push(function() { setButtonLED(CC_LOOP, LED_DIM); });
+    commands.push(function() { setButtonLED(CC_CAPTURE, LED_DIM); });
+    commands.push(function() { setButtonLED(CC_BACK, LED_DIM); });
+
+    /* Pad LEDs — dim grey to show audition is available */
+    for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
+        commands.push((function(note) {
+            return function() { setLED(note, PAD_COLOR_DIM); };
+        })(p));
+    }
+
+    /* Send a batch per frame */
+    var end = ledInitIndex + LEDS_PER_FRAME;
+    if (end > commands.length) end = commands.length;
+    for (var i = ledInitIndex; i < end; i++) {
+        commands[i]();
+    }
+    ledInitIndex = end;
+
+    if (ledInitIndex >= commands.length) {
+        ledInitPending = false;
+    }
+}
+
+/**
+ * Update LEDs based on current state (call after state changes).
+ */
+function updateLeds() {
+    if (ledInitPending) return; /* Don't send until init completes */
+    setButtonLED(CC_LOOP, loopEnabled ? LED_BRIGHT : LED_DIM);
+    setButtonLED(CC_UNDO, hasUndo ? LED_MED : LED_DIM);
+    setButtonLED(CC_COPY, hasClipboard ? LED_MED : LED_DIM);
+}
+
+/* ============ Helpers ============ */
+
+/* decodeDelta imported from shared/input_filter.mjs */
+
+/**
+ * Truncate a string with ".." suffix if it exceeds maxLen.
+ */
+function truncate(str, maxLen) {
+    if (str.length <= maxLen) return str;
+    return str.substring(0, maxLen - 2) + "..";
+}
+
+/**
+ * Format a sample position as seconds string.
+ */
+function formatTime(samples) {
+    if (totalFrames <= 0) return "0.000s";
+    var secs = samples / sampleRate;
+    return secs.toFixed(3) + "s";
+}
+
+/**
+ * Format dB value for display.
+ */
+function formatDb(db) {
+    if (db <= -100) return "-inf";
+    var sign = db >= 0 ? "+" : "";
+    return sign + db.toFixed(1) + "dB";
+}
+
+/**
+ * Format selection duration for display.
+ * Adaptive precision: 3 decimals for <1s, 2 for <10s, 1 for rest.
+ */
+function formatSelDuration() {
+    var dur = Math.abs(endSample - startSample) / sampleRate;
+    if (dur < 1) return dur.toFixed(3) + "s";
+    if (dur < 10) return dur.toFixed(2) + "s";
+    return dur.toFixed(1) + "s";
+}
+
+/**
+ * Show a temporary status message for a given number of frames.
+ * Used for action confirmations (trim, save, copy, etc.).
+ */
+function showStatus(msg, frames) {
+    statusMsg = msg;
+    statusTimer = frames || 60;
+}
+
+/**
+ * Set the status message for a specific knob (persists while touched).
+ * knobIndex: 0-7 mapping to physical knobs 1-8.
+ */
+function showKnobStatus(knobIndex, msg) {
+    if (knobIndex < 0 || knobIndex > 7) return;
+    knobStatusMsg[knobIndex] = msg;
+    /* Push this knob to most-recent in touch order */
+    pushTouchOrder(knobIndex);
+}
+
+/**
+ * Set the status message for the jog wheel (decays on timer).
+ * Each call resets the hold timer and makes jog most-recent.
+ */
+function showJogStatus(msg) {
+    jogStatusMsg = msg;
+    jogHeldTimer = JOG_HOLD_FRAMES;
+    pushTouchOrder(JOG_ID);
+}
+
+/**
+ * Push an id (knob index or JOG_ID) to the most-recent position
+ * in the touch order stack, removing any existing entry first.
+ */
+function pushTouchOrder(id) {
+    for (var t = 0; t < knobTouchOrder.length; t++) {
+        if (knobTouchOrder[t] === id) {
+            knobTouchOrder.splice(t, 1);
+            break;
+        }
+    }
+    knobTouchOrder.push(id);
+}
+
+/**
+ * Get the current status message to display.
+ * Priority: timed message > most recently active control > nothing.
+ * Controls are active if: knob is touched, or jog timer is running.
+ */
+function getActiveStatus() {
+    /* Timed messages (action confirmations) take priority */
+    if (statusTimer > 0) return statusMsg;
+    /* Walk touch order from most recent to oldest */
+    for (var i = knobTouchOrder.length - 1; i >= 0; i--) {
+        var id = knobTouchOrder[i];
+        if (id === JOG_ID) {
+            if (jogHeldTimer > 0 && jogStatusMsg !== "") return jogStatusMsg;
+        } else {
+            if (knobTouched[id] && knobStatusMsg[id] !== "") return knobStatusMsg[id];
+        }
+    }
+    return "";
+}
+
+/**
+ * Get adaptive coarse step size based on zoom level and file length.
+ * At zoom 0, step is large for quick navigation.
+ * At higher zoom, step is finer for precision.
+ */
+function getCoarseStep() {
+    if (totalFrames <= 0) return 1;
+    var visibleRange = getVisibleEnd() - getVisibleStart();
+    /* Step is 1 pixel worth of samples — minimum useful movement */
+    var step = Math.floor(visibleRange / SCREEN_W);
+    if (step < 1) step = 1;
+    return step;
+}
+
+/**
+ * Get the number of visible samples at the current zoom level.
+ * Minimum 128 samples (1 sample per pixel).
+ */
+function getVisibleSamples() {
+    if (zoomLevel <= 0 || totalFrames <= 0) return totalFrames;
+    var vis = Math.floor(totalFrames / Math.pow(2, zoomLevel));
+    if (vis < 128) vis = 128;
+    return vis;
+}
+
+/**
+ * Get the starting sample of the visible window based on zoom.
+ */
+function getVisibleStart() {
+    if (zoomLevel <= 0 || totalFrames <= 0) return 0;
+    var visibleSamples = getVisibleSamples();
+    var center = zoomCenter;
+    var start = center - Math.floor(visibleSamples / 2);
+    if (start < 0) start = 0;
+    if (start + visibleSamples > totalFrames) start = totalFrames - visibleSamples;
+    if (start < 0) start = 0;
+    return start;
+}
+
+/**
+ * Get the ending sample of the visible window based on zoom.
+ */
+function getVisibleEnd() {
+    if (zoomLevel <= 0 || totalFrames <= 0) return totalFrames;
+    var visibleSamples = getVisibleSamples();
+    var start = getVisibleStart();
+    var end = start + visibleSamples;
+    if (end > totalFrames) end = totalFrames;
+    return end;
+}
+
+/**
+ * Convert a sample position to a pixel x coordinate in the waveform area.
+ * Returns -1 if the sample is outside the visible range.
+ */
+function sampleToPixel(sample) {
+    var vStart = getVisibleStart();
+    var vEnd = getVisibleEnd();
+    var range = vEnd - vStart;
+    if (range <= 0) return -1;
+    var x = Math.floor(((sample - vStart) / range) * SCREEN_W);
+    if (x < 0 || x >= SCREEN_W) return -1;
+    return x;
+}
+
+/**
+ * Adjust a marker (start=0, end=1) by deltaSamples. Clamps to valid range.
+ * Ensures start <= end. Auto-scrolls view to keep the active marker visible.
+ */
+function adjustMarker(field, deltaSamples) {
+    if (field === 0) {
+        startSample += deltaSamples;
+        if (startSample < 0) startSample = 0;
+        if (startSample > endSample) startSample = endSample;
+    } else {
+        endSample += deltaSamples;
+        if (endSample > totalFrames) endSample = totalFrames;
+        if (endSample < startSample) endSample = startSample;
+    }
+
+    /* Auto-scroll: keep active marker within 10%-90% of visible window */
+    if (zoomLevel > 0) {
+        var markerPos = (field === 0) ? startSample : endSample;
+        var vStart = getVisibleStart();
+        var vEnd = getVisibleEnd();
+        var vRange = vEnd - vStart;
+        var margin = Math.floor(vRange * 0.10);
+
+        if (markerPos < vStart + margin) {
+            /* Marker near left edge — scroll left */
+            zoomCenter = markerPos + Math.floor(vRange / 2) - margin;
+        } else if (markerPos > vEnd - margin) {
+            /* Marker near right edge — scroll right */
+            zoomCenter = markerPos - Math.floor(vRange / 2) + margin;
+        }
+        /* Clamp zoomCenter */
+        if (zoomCenter < 0) zoomCenter = 0;
+        if (zoomCenter > totalFrames) zoomCenter = totalFrames;
+    }
+
+    syncMarkersToDs();
+}
+
+/**
+ * Send current marker positions to DSP.
+ * Combined into a single param to avoid fire-and-forget race
+ * in overtake mode where rapid sequential calls overwrite each other.
+ */
+function syncMarkersToDs() {
+    host_module_set_param("markers", startSample + "," + endSample);
+}
+
+/**
+ * Sync zoom and refresh waveform.
+ * Zoom params are encoded in the waveform GET request to avoid
+ * fire-and-forget race (SET is lost when followed by GET).
+ */
+function syncZoomToDsp() {
+    refreshWaveform();
+}
+
+/* ============ DSP Communication ============ */
+
+/**
+ * Fetch file info from DSP.
+ */
+function refreshFileInfo() {
+    var raw = host_module_get_param("file_info");
+    if (!raw) return;
+    try {
+        var info = JSON.parse(raw);
+        fileName = info.name || "";
+        fileDuration = info.duration || 0;
+        totalFrames = info.frames || 0;
+        startSample = info.start || 0;
+        endSample = info.end || totalFrames;
+        /* Fetch sample rate separately */
+        var srRaw = host_module_get_param("sample_rate");
+        if (srRaw) sampleRate = parseInt(srRaw, 10) || 44100;
+    } catch (e) {
+        /* ignore parse errors */
+    }
+}
+
+/**
+ * Fetch waveform data from DSP. Returns array of [min, max] pairs.
+ * Only call when markers or zoom change, not every tick.
+ */
+function refreshWaveform() {
+    var vStart = getVisibleStart();
+    var vEnd = getVisibleEnd();
+
+    /* Skip the expensive round-trip if visible range hasn't changed */
+    if (!waveformDirty && vStart === cachedVisStart && vEnd === cachedVisEnd && waveformData) {
+        return;
+    }
+
+    var raw = host_module_get_param("waveform:" + vStart + "," + vEnd);
+    if (!raw) {
+        waveformData = null;
+        return;
+    }
+    try {
+        waveformData = JSON.parse(raw);
+        cachedVisStart = vStart;
+        cachedVisEnd = vEnd;
+        waveformDirty = false;
+    } catch (e) {
+        waveformData = null;
+    }
+}
+
+/**
+ * Mark waveform cache stale (call after destructive edits).
+ */
+function invalidateWaveform() {
+    waveformDirty = true;
+    seamWaveformDirty = true;
+    refreshWaveform();
+}
+
+/**
+ * Get the number of samples per half of the seam view (64 columns).
+ */
+function getSeamHalfSamples() {
+    return Math.floor(64 * Math.pow(2, seamZoomLevel));
+}
+
+/**
+ * Get coarse step for loop mode (1 pixel worth of seam samples).
+ */
+function getLoopCoarseStep() {
+    var halfSamples = getSeamHalfSamples();
+    var step = Math.floor(halfSamples / 64);
+    if (step < 1) step = 1;
+    return step;
+}
+
+/**
+ * Fetch seam waveform data from DSP. Returns array of [min, max] pairs.
+ * Only re-fetch when markers or seam zoom changes.
+ */
+function refreshSeamWaveform() {
+    var halfSamples = getSeamHalfSamples();
+
+    if (!seamWaveformDirty &&
+        startSample === cachedSeamStart &&
+        endSample === cachedSeamEnd &&
+        halfSamples === cachedSeamHalf &&
+        seamWaveformData) {
+        return;
+    }
+
+    var raw = host_module_get_param("seam_waveform:" + startSample + "," + endSample + "," + halfSamples);
+    if (!raw) {
+        seamWaveformData = null;
+        return;
+    }
+    try {
+        seamWaveformData = JSON.parse(raw);
+        cachedSeamStart = startSample;
+        cachedSeamEnd = endSample;
+        cachedSeamHalf = halfSamples;
+        seamWaveformDirty = false;
+    } catch (e) {
+        seamWaveformData = null;
+    }
+}
+
+/**
+ * Mark seam waveform cache stale.
+ */
+function invalidateSeamWaveform() {
+    seamWaveformDirty = true;
+    refreshSeamWaveform();
+}
+
+/**
+ * Refresh play state, undo, dirty flags from DSP.
+ */
+function refreshState() {
+    var raw;
+
+    raw = host_module_get_param("has_undo");
+    hasUndo = (raw === "1" || raw === "true");
+
+    raw = host_module_get_param("has_clipboard");
+    hasClipboard = (raw === "1" || raw === "true");
+
+    raw = host_module_get_param("dirty");
+    dirty = (raw === "1" || raw === "true");
+
+    raw = host_module_get_param("play_loop");
+    loopEnabled = (raw === "1" || raw === "true");
+
+    raw = host_module_get_param("gain_db");
+    if (raw) { var v = parseFloat(raw); if (!isNaN(v)) gainDb = v; }
+
+    raw = host_module_get_param("peak_db");
+    if (raw) { var v2 = parseFloat(raw); if (!isNaN(v2)) peakDb = v2; }
+}
+
+/* ============ Drawing: Common ============ */
+
+/**
+ * Draw horizontal divider line.
+ */
+function drawDivider(y) {
+    draw_line(0, y, SCREEN_W - 1, y, 1);
+}
+
+/**
+ * Print text centered horizontally at the given y coordinate.
+ */
+function printCentered(y, text) {
+    var tw = text.length * 6;
+    var x = Math.floor((SCREEN_W - tw) / 2);
+    if (x < 0) x = 0;
+    print(x, y, text, 1);
+}
+
+/**
+ * Build mode header string with indicators.
+ * Format: "MODE*L" where * = dirty, L = loop enabled.
+ */
+function buildModeHeader(modeName) {
+    var s = modeName;
+    if (dirty) s += "*";
+    if (loopEnabled) s += " L";
+    return s;
+}
+
+/**
+ * Draw the waveform in the waveform area.
+ * In-selection region draws solid lines; outside-selection draws endpoints only.
+ */
+function drawWaveform() {
+    if (!waveformData || waveformData.length === 0) {
+        print(20, WAVE_MID - 3, "No waveform data", 1);
+        return;
+    }
+
+    var vStart = getVisibleStart();
+    var vEnd = getVisibleEnd();
+    var vRange = vEnd - vStart;
+
+    /* Compute selection pixel range */
+    var selStartPx = -1;
+    var selEndPx = SCREEN_W;
+    if (vRange > 0) {
+        selStartPx = Math.floor(((startSample - vStart) / vRange) * SCREEN_W);
+        selEndPx = Math.floor(((endSample - vStart) / vRange) * SCREEN_W);
+    }
+
+    var halfH = WAVE_HEIGHT / 2;
+    var gainLinear = (gainDb !== 0.0) ? Math.pow(10, gainDb / 20) : 1.0;
+
+    for (var x = 0; x < SCREEN_W && x < waveformData.length; x++) {
+        var pair = waveformData[x];
+        var minVal = pair[0] * vScale * gainLinear; /* Apply vertical scale + gain */
+        var maxVal = pair[1] * vScale * gainLinear;
+
+        /* Clamp after scaling */
+        if (minVal < -1) minVal = -1;
+        if (minVal > 1) minVal = 1;
+        if (maxVal < -1) maxVal = -1;
+        if (maxVal > 1) maxVal = 1;
+
+        /* Map -1..1 to pixel y range */
+        var yMin = Math.round(WAVE_MID - maxVal * halfH);
+        var yMax = Math.round(WAVE_MID - minVal * halfH);
+
+        /* Clamp to waveform area */
+        if (yMin < WAVE_Y_TOP) yMin = WAVE_Y_TOP;
+        if (yMax > WAVE_Y_BOT - 1) yMax = WAVE_Y_BOT - 1;
+        if (yMin > WAVE_Y_BOT - 1) yMin = WAVE_Y_BOT - 1;
+        if (yMax < WAVE_Y_TOP) yMax = WAVE_Y_TOP;
+
+        var inSelection = (x >= selStartPx && x <= selEndPx);
+
+        if (inSelection) {
+            /* Draw solid vertical line for in-selection */
+            if (yMin === yMax) {
+                set_pixel(x, yMin, 1);
+            } else {
+                draw_line(x, yMin, x, yMax, 1);
+            }
+        } else {
+            /* Draw only top and bottom pixels for outside-selection (dimmed) */
+            set_pixel(x, yMin, 1);
+            if (yMax !== yMin) {
+                set_pixel(x, yMax, 1);
+            }
+        }
+    }
+
+    /* Draw start marker */
+    var startPx = sampleToPixel(startSample);
+    if (startPx >= 0 && startPx < SCREEN_W) {
+        for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y += 2) {
+            set_pixel(startPx, y, 1);
+        }
+    }
+
+    /* Draw end marker */
+    var endPx = sampleToPixel(endSample);
+    if (endPx >= 0 && endPx < SCREEN_W) {
+        for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y += 2) {
+            set_pixel(endPx, y, 1);
+        }
+    }
+
+    /* Draw playhead */
+    if (playing) {
+        var playPx = sampleToPixel(playPos);
+        if (playPx >= 0 && playPx < SCREEN_W) {
+            for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y++) {
+                if (y % 3 !== 0) {
+                    set_pixel(playPx, y, 1);
+                }
+            }
+        }
+    }
+
+    /* Zoom minimap — thin bar at bottom of waveform showing viewport position */
+    if (zoomLevel > 0 && totalFrames > 0) {
+        var mapY = WAVE_Y_BOT;
+        /* Base line showing full file extent */
+        draw_line(0, mapY, SCREEN_W - 1, mapY, 1);
+        /* Thick bar showing visible viewport within the file */
+        var vpStartPx = Math.floor((vStart / totalFrames) * SCREEN_W);
+        var vpEndPx = Math.floor((vEnd / totalFrames) * SCREEN_W);
+        if (vpEndPx <= vpStartPx) vpEndPx = vpStartPx + 1;
+        fill_rect(vpStartPx, mapY - 1, vpEndPx - vpStartPx, 3, 1);
+    }
+}
+
+/* ============ Drawing: Trim View ============ */
+
+function drawTrimView() {
+    clear_screen();
+
+    /* Header: MODE*L  filename.wav  1.2s */
+    var modeStr = buildModeHeader("TRIM");
+    print(0, 0, modeStr, 1);
+    var nameX = (modeStr.length + 1) * 6;
+    var maxNameChars = Math.floor((SCREEN_W - nameX - 36) / 6);
+    if (maxNameChars < 4) maxNameChars = 4;
+    var dispName = truncate(fileName, maxNameChars);
+    print(nameX, 0, dispName, 1);
+    var durStr = fileDuration > 0 ? fileDuration.toFixed(1) + "s" : "";
+    var durX = SCREEN_W - durStr.length * 6;
+    print(durX, 0, durStr, 1);
+
+    /* Top divider */
+    drawDivider(10);
+
+    /* Waveform area */
+    drawWaveform();
+
+    /* Bottom divider */
+    drawDivider(WAVE_Y_BOT + 1);
+
+    /* Footer: active status (centered) or marker positions */
+    var footerStatus = getActiveStatus();
+    if (footerStatus !== "") {
+        printCentered(54, footerStatus);
+    } else {
+        var startStr = "S:" + formatTime(startSample);
+        var endStr = "E:" + formatTime(endSample);
+
+        if (selectedField === 0) {
+            print(0, 54, ">", 1);
+            print(6, 54, startStr, 1);
+            var ex = SCREEN_W - endStr.length * 6;
+            if (ex < 70) ex = 70;
+            print(ex, 54, endStr, 1);
+        } else {
+            print(0, 54, startStr, 1);
+            var ex2 = SCREEN_W - (endStr.length + 1) * 6;
+            if (ex2 < 60) ex2 = 60;
+            print(ex2, 54, ">", 1);
+            print(ex2 + 6, 54, endStr, 1);
+        }
+    }
+}
+
+/* ============ Drawing: Loop View ============ */
+
+/**
+ * Draw the seam waveform in the waveform area.
+ * 128 columns: left 64 approach loop end, right 64 continue from loop start.
+ * Center dashed line at x=64 marks the seam point.
+ */
+function drawSeamWaveform() {
+    if (!seamWaveformData || seamWaveformData.length === 0) {
+        print(20, WAVE_MID - 3, "No seam data", 1);
+        return;
+    }
+
+    var halfH = WAVE_HEIGHT / 2;
+    var gainLinear = (gainDb !== 0.0) ? Math.pow(10, gainDb / 20) : 1.0;
+
+    for (var x = 0; x < SCREEN_W && x < seamWaveformData.length; x++) {
+        var pair = seamWaveformData[x];
+        var minVal = pair[0] * vScale * gainLinear;
+        var maxVal = pair[1] * vScale * gainLinear;
+
+        if (minVal < -1) minVal = -1;
+        if (minVal > 1) minVal = 1;
+        if (maxVal < -1) maxVal = -1;
+        if (maxVal > 1) maxVal = 1;
+
+        var yMin = Math.round(WAVE_MID - maxVal * halfH);
+        var yMax = Math.round(WAVE_MID - minVal * halfH);
+
+        if (yMin < WAVE_Y_TOP) yMin = WAVE_Y_TOP;
+        if (yMax > WAVE_Y_BOT - 1) yMax = WAVE_Y_BOT - 1;
+        if (yMin > WAVE_Y_BOT - 1) yMin = WAVE_Y_BOT - 1;
+        if (yMax < WAVE_Y_TOP) yMax = WAVE_Y_TOP;
+
+        if (yMin === yMax) {
+            set_pixel(x, yMin, 1);
+        } else {
+            draw_line(x, yMin, x, yMax, 1);
+        }
+    }
+
+    /* Dashed center line at x=64 (the seam junction) */
+    for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y += 2) {
+        set_pixel(64, y, 1);
+    }
+
+    /* Draw playhead if playing */
+    if (playing) {
+        /* Map play position into seam view coordinates */
+        var halfSamples = getSeamHalfSamples();
+        var leftStart = endSample - halfSamples;
+        if (leftStart < 0) leftStart = 0;
+        var playPx = -1;
+
+        /* Check if playhead is in the left half (approaching end) */
+        if (playPos >= leftStart && playPos <= endSample) {
+            var range = endSample - leftStart;
+            if (range > 0) playPx = Math.floor(((playPos - leftStart) / range) * 64);
+        }
+        /* Check if playhead is in the right half (after loop start) */
+        var rightEnd = startSample + halfSamples;
+        if (rightEnd > totalFrames) rightEnd = totalFrames;
+        if (playPos >= startSample && playPos <= rightEnd) {
+            var range2 = rightEnd - startSample;
+            if (range2 > 0) playPx = 64 + Math.floor(((playPos - startSample) / range2) * 64);
+        }
+
+        if (playPx >= 0 && playPx < SCREEN_W) {
+            for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y++) {
+                if (y % 3 !== 0) {
+                    set_pixel(playPx, y, 1);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Draw the Loop mode view (Akai S1000-style seam view).
+ */
+function drawLoopView() {
+    clear_screen();
+
+    /* Header: LOOP*L  filename.wav  1.2s */
+    var modeStr = buildModeHeader("LOOP");
+    print(0, 0, modeStr, 1);
+    var nameX = (modeStr.length + 1) * 6;
+    var maxNameChars = Math.floor((SCREEN_W - nameX - 36) / 6);
+    if (maxNameChars < 4) maxNameChars = 4;
+    var dispName = truncate(fileName, maxNameChars);
+    print(nameX, 0, dispName, 1);
+    var durStr = fileDuration > 0 ? fileDuration.toFixed(1) + "s" : "";
+    var durX = SCREEN_W - durStr.length * 6;
+    print(durX, 0, durStr, 1);
+
+    /* Top divider */
+    drawDivider(10);
+
+    /* Seam waveform area */
+    refreshSeamWaveform();
+    drawSeamWaveform();
+
+    /* Bottom divider */
+    drawDivider(WAVE_Y_BOT + 1);
+
+    /* Footer: active status or loop point/length info */
+    var footerStatus = getActiveStatus();
+    if (footerStatus !== "") {
+        printCentered(54, footerStatus);
+    } else {
+        var ptStr = "Pt:" + formatTime(startSample);
+        var lenStr = "Len:" + formatSelDuration();
+
+        if (loopSelectedField === 0) {
+            print(0, 54, ">", 1);
+            print(6, 54, ptStr, 1);
+            var lx = SCREEN_W - lenStr.length * 6;
+            if (lx < 70) lx = 70;
+            print(lx, 54, lenStr, 1);
+        } else {
+            print(0, 54, ptStr, 1);
+            var lx2 = SCREEN_W - (lenStr.length + 1) * 6;
+            if (lx2 < 60) lx2 = 60;
+            print(lx2, 54, ">", 1);
+            print(lx2 + 6, 54, lenStr, 1);
+        }
+    }
+}
+
+/* ============ Drawing: Mode Menu ============ */
+
+function drawModeMenu() {
+    clear_screen();
+
+    /* Header */
+    print(0, 0, "WAVEFORM EDITOR", 1);
+    drawDivider(10);
+
+    /* Menu items */
+    var itemH = 12;
+    var startY = 14;
+
+    for (var i = 0; i < menuItems.length; i++) {
+        var y = startY + i * itemH;
+        if (y + itemH > SCREEN_H) break;
+
+        if (i === menuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(4, y + 2, menuItems[i], 0);
+        } else {
+            print(4, y + 2, menuItems[i], 1);
+        }
+    }
+
+    /* Footer hint */
+    drawDivider(SCREEN_H - 9);
+    print(2, SCREEN_H - 7, "Jog:select  Back:exit", 1);
+}
+
+/* ============ Drawing: Confirm Exit ============ */
+
+function drawConfirmExit() {
+    clear_screen();
+
+    /* Title */
+    print(16, 2, "Unsaved changes", 1);
+    drawDivider(12);
+
+    /* Options */
+    var startY = 18;
+    var itemH = 14;
+
+    for (var i = 0; i < confirmItems.length; i++) {
+        var y = startY + i * itemH;
+
+        if (i === confirmIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, confirmItems[i], 0);
+        } else {
+            print(8, y + 3, confirmItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: Confirm Normalize ============ */
+
+function drawConfirmNormalize() {
+    clear_screen();
+
+    /* Title */
+    printCentered(2, "Normalize to -0.3dB?");
+    drawDivider(12);
+
+    /* Info: show current peak */
+    var peakStr = "Peak: " + formatDb(peakDb);
+    printCentered(18, peakStr);
+
+    /* Options */
+    var startY = 30;
+    var itemH = 14;
+
+    for (var i = 0; i < normalizeItems.length; i++) {
+        var y = startY + i * itemH;
+
+        if (i === normalizeIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, normalizeItems[i], 0);
+        } else {
+            print(8, y + 3, normalizeItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: Confirm Save ============ */
+
+function drawConfirmSave() {
+    clear_screen();
+
+    /* Title */
+    printCentered(2, "Overwrite file?");
+    drawDivider(12);
+
+    /* Info: show filename */
+    printCentered(18, truncate(fileName, 20));
+
+    /* Options */
+    var startY = 30;
+    var itemH = 14;
+
+    for (var i = 0; i < saveItems.length; i++) {
+        var y = startY + i * itemH;
+
+        if (i === saveIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, saveItems[i], 0);
+        } else {
+            print(8, y + 3, saveItems[i], 1);
+        }
+    }
+}
+
+/* ============ Navigation & Actions ============ */
+
+/**
+ * Switch to a given view.
+ */
+function switchView(view) {
+    currentView = view;
+    if (view === VIEW_TRIM) {
+        refreshState();
+        refreshWaveform();
+        updateLeds();
+    } else if (view === VIEW_LOOP) {
+        /* Auto-enable loop when entering loop mode */
+        if (!loopEnabled) {
+            loopEnabled = true;
+            host_module_set_param("play_loop", "1");
+        }
+        refreshState();
+        invalidateSeamWaveform();
+        updateLeds();
+    }
+}
+
+/**
+ * Handle mode menu selection.
+ */
+function menuSelect() {
+    switch (menuIndex) {
+        case 0: /* Edit */
+            switchView(VIEW_TRIM);
+            break;
+        case 1: /* Loop */
+            switchView(VIEW_LOOP);
+            break;
+        case 2: /* Open File */
+            enterOpenFileBrowser();
+            break;
+        case 3: /* Exit Editor */
+            attemptExit();
+            break;
+    }
+}
+
+function enterOpenFileBrowser() {
+    var currentFile = host_module_get_param("file_path") || "";
+    openFileBrowserState = buildFilepathBrowserState(
+        { root: "/data/UserData/UserLibrary/Samples", filter: ".wav", name: "Open File" },
+        currentFile
+    );
+    refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+    currentView = VIEW_OPEN_FILE;
+}
+
+function drawOpenFileBrowser() {
+    clear_screen();
+
+    var state = openFileBrowserState;
+    if (!state) {
+        print(0, 0, "OPEN FILE", 1);
+        drawDivider(10);
+        print(4, 28, "Browser unavailable", 1);
+        return;
+    }
+
+    /* Header with directory name */
+    var dir = state.currentDir || "";
+    var dirName = dir.substring(dir.lastIndexOf("/") + 1) || "Samples";
+    print(0, 0, dirName, 1);
+    drawDivider(10);
+
+    if (!state.items || state.items.length === 0) {
+        print(4, 28, "No files found", 1);
+        drawDivider(SCREEN_H - 9);
+        print(2, SCREEN_H - 7, "Back: up", 1);
+        return;
+    }
+
+    /* Draw file list */
+    var itemH = 10;
+    var startY = 14;
+    var maxVisible = Math.floor((SCREEN_H - 9 - startY) / itemH);
+    var startIdx = 0;
+    if (state.selectedIndex > maxVisible - 2) {
+        startIdx = state.selectedIndex - (maxVisible - 2);
+    }
+    var endIdx = Math.min(startIdx + maxVisible, state.items.length);
+
+    for (var i = startIdx; i < endIdx; i++) {
+        var y = startY + (i - startIdx) * itemH;
+        var item = state.items[i];
+        if (i === state.selectedIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(4, y + 1, item.label, 0);
+        } else {
+            print(4, y + 1, item.label, 1);
+        }
+    }
+
+    /* Scroll indicators */
+    if (startIdx > 0) print(SCREEN_W - 6, startY, "^", 1);
+    if (endIdx < state.items.length) print(SCREEN_W - 6, SCREEN_H - 12, "v", 1);
+
+    drawDivider(SCREEN_H - 9);
+    var sel = state.items[state.selectedIndex];
+    var hint = sel && sel.kind === "file" ? "Push:load  Back:up" : "Push:open  Back:up";
+    print(2, SCREEN_H - 7, hint, 1);
+}
+
+/**
+ * Handle confirm exit selection.
+ */
+function confirmSelect() {
+    switch (confirmIndex) {
+        case 0: /* Save & Exit */
+            doSave();
+            exitEditor();
+            break;
+        case 1: /* Discard */
+            exitEditor();
+            break;
+        case 2: /* Cancel */
+            switchView(VIEW_MODE_MENU);
+            break;
+    }
+}
+
+/**
+ * Handle confirm normalize selection.
+ */
+function normalizeSelect() {
+    switch (normalizeIndex) {
+        case 0: /* Normalize */
+            doNormalize();
+            switchView(VIEW_TRIM);
+            break;
+        case 1: /* Cancel */
+            switchView(VIEW_TRIM);
+            break;
+    }
+}
+
+/**
+ * Handle confirm save selection.
+ */
+function saveSelect() {
+    switch (saveIndex) {
+        case 0: /* Overwrite */
+            doSave();
+            switchView(saveReturnView);
+            break;
+        case 1: /* Cancel */
+            switchView(saveReturnView);
+            break;
+    }
+}
+
+/**
+ * Save file (auto-apply gain if non-zero).
+ */
+function doSave() {
+    if (gainDb !== 0.0) {
+        host_module_set_param("apply_gain", "1");
+    }
+    host_module_set_param("save", "1");
+    showStatus("Saved!", 90);
+    refreshState();
+    refreshFileInfo();
+    invalidateWaveform();
+}
+
+/**
+ * Attempt to exit. If dirty, show confirm dialog; otherwise exit.
+ */
+function attemptExit() {
+    refreshState();
+    if (dirty) {
+        confirmIndex = 0;
+        switchView(VIEW_CONFIRM_EXIT);
+    } else {
+        exitEditor();
+    }
+}
+
+/**
+ * Exit the editor. Signals intent to DSP. Actual exit happens via
+ * the overtake exit mechanism (Shift+Vol+Jog Click) or host navigation.
+ */
+function exitEditor() {
+    if (typeof host_exit_module === "function") {
+        host_exit_module();
+    }
+}
+
+/**
+ * Queue playback start. Actual set_param issued in tick() to avoid
+ * fire-and-forget race with encoder param updates.
+ */
+function startPlayback() {
+    pendingPlay = shiftHeld ? "whole" : "selection";
+    playing = true;
+}
+
+/**
+ * Queue playback stop.
+ */
+function stopPlayback() {
+    pendingPlay = "stop";
+    playing = false;
+}
+
+/**
+ * Toggle loop mode.
+ */
+function toggleLoop() {
+    loopEnabled = !loopEnabled;
+    host_module_set_param("play_loop", loopEnabled ? "1" : "0");
+    showStatus(loopEnabled ? "Loop ON" : "Loop OFF", 45);
+    updateLeds();
+}
+
+/**
+ * Execute trim operation (discard audio outside markers).
+ */
+function doTrim() {
+    host_module_set_param("trim", "1");
+    showStatus("Trimmed", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Copy selection to clipboard.
+ */
+function doCopy() {
+    host_module_set_param("copy", "1");
+    hasClipboard = true;
+    showStatus("Copied", 60);
+    updateLeds();
+}
+
+/**
+ * Mute (zero out) selection.
+ */
+function doMute() {
+    host_module_set_param("mute", "1");
+    showStatus("Muted", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Cut selection to clipboard (copy + remove).
+ */
+function doCut() {
+    host_module_set_param("cut", "1");
+    hasClipboard = true;
+    showStatus("Cut", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Paste clipboard at cursor (insert at start_sample).
+ */
+function doPaste() {
+    refreshState();
+    if (!hasClipboard) {
+        showStatus("Nothing to paste", 45);
+        return;
+    }
+    host_module_set_param("paste", "1");
+    showStatus("Pasted", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Export selection to new file (filename_edit.wav).
+ */
+function doExport() {
+    host_module_set_param("export", "1");
+    var result = host_module_get_param("copy_result");
+    if (result && result !== "" && result !== "ERROR") {
+        showStatus("Exported!", 60);
+    } else {
+        showStatus("Export failed", 60);
+    }
+}
+
+/**
+ * Undo last destructive operation.
+ */
+function doUndo() {
+    refreshState();
+    if (!hasUndo) {
+        showStatus("Nothing to undo", 45);
+        return;
+    }
+    host_module_set_param("undo", "1");
+    showStatus("Undone", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Apply gain permanently.
+ */
+function doApplyGain() {
+    host_module_set_param("apply_gain", "1");
+    showStatus("Gain applied", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Normalize audio to -0.3dBFS.
+ */
+function doNormalize() {
+    host_module_set_param("normalize", "1");
+    showStatus("Normalized", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/* ============ MIDI Input Handling ============ */
+
+/**
+ * Handle CC messages.
+ */
+function handleCC(cc, value) {
+    /* Shift tracking */
+    if (cc === CC_SHIFT) {
+        shiftHeld = (value === 127);
+        return;
+    }
+
+    /* Only handle presses (value > 0) for remaining CCs, except jog/encoders */
+    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4);
+
+    /* Back button */
+    if (cc === CC_BACK && value > 0) {
+        switch (currentView) {
+            case VIEW_TRIM:
+            case VIEW_LOOP:
+                switchView(VIEW_MODE_MENU);
+                break;
+            case VIEW_MODE_MENU:
+                attemptExit();
+                break;
+            case VIEW_CONFIRM_EXIT:
+                switchView(VIEW_MODE_MENU);
+                break;
+            case VIEW_CONFIRM_NORMALIZE:
+                switchView(VIEW_TRIM);
+                break;
+            case VIEW_CONFIRM_SAVE:
+                switchView(saveReturnView);
+                break;
+            case VIEW_OPEN_FILE:
+                if (openFileBrowserState && openFileBrowserState.currentDir !== openFileBrowserState.root) {
+                    /* Navigate up one directory */
+                    var dir = openFileBrowserState.currentDir;
+                    var lastSlash = dir.lastIndexOf("/");
+                    if (lastSlash > 0) {
+                        openFileBrowserState.currentDir = dir.substring(0, lastSlash);
+                        if (openFileBrowserState.currentDir.length < openFileBrowserState.root.length) {
+                            openFileBrowserState.currentDir = openFileBrowserState.root;
+                        }
+                    } else {
+                        openFileBrowserState.currentDir = openFileBrowserState.root;
+                    }
+                    openFileBrowserState.selectedIndex = 0;
+                    openFileBrowserState.selectedPath = "";
+                    refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+                } else {
+                    openFileBrowserState = null;
+                    currentView = VIEW_MODE_MENU;
+                }
+                break;
+        }
+        return;
+    }
+
+    /* Mute button — zero out selection */
+    if (cc === CC_MUTE && value > 0) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            doMute();
+            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+        }
+        return;
+    }
+
+    /* Delete button — cut selection to clipboard */
+    if (cc === CC_DELETE && value > 0) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            doCut();
+            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+        }
+        return;
+    }
+
+    /* Copy button: normal = copy to clipboard, shift = paste */
+    if (cc === CC_COPY && value > 0) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            if (shiftHeld) {
+                doPaste();
+                if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+            } else {
+                doCopy();
+            }
+        }
+        return;
+    }
+
+    /* Undo button */
+    if (cc === CC_UNDO && value > 0) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            doUndo();
+            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+        }
+        return;
+    }
+
+    /* Loop button */
+    if (cc === CC_LOOP && value > 0) {
+        if (currentView === VIEW_LOOP) {
+            if (shiftHeld) {
+                /* Shift+Loop: find zero crossing */
+                host_module_set_param("find_zero_crossing", "1");
+                var newStart = host_module_get_param("start_sample");
+                if (newStart) startSample = parseInt(newStart, 10) || 0;
+                syncMarkersToDs();
+                invalidateSeamWaveform();
+                showStatus("Zero-X found", 60);
+            } else {
+                /* Loop button in loop view: return to trim */
+                switchView(VIEW_TRIM);
+            }
+        } else if (currentView === VIEW_TRIM) {
+            if (shiftHeld) {
+                /* Shift+Loop in trim view: toggle loop on/off */
+                toggleLoop();
+            } else {
+                /* Loop button in trim view: enter loop view */
+                switchView(VIEW_LOOP);
+            }
+        }
+        return;
+    }
+
+    /* Capture button — normal: save with confirmation, shift: export to file */
+    if (cc === CC_CAPTURE && value > 0) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            if (shiftHeld) {
+                doExport();
+            } else {
+                saveIndex = 0;
+                saveReturnView = currentView;
+                switchView(VIEW_CONFIRM_SAVE);
+            }
+        }
+        return;
+    }
+
+    /* Jog wheel turn */
+    if (cc === CC_JOG) {
+        var delta = decodeDelta(value);
+        if (delta === 0) return;
+
+        switch (currentView) {
+            case VIEW_MODE_MENU:
+                menuIndex += delta;
+                if (menuIndex < 0) menuIndex = 0;
+                if (menuIndex >= menuItems.length) menuIndex = menuItems.length - 1;
+                break;
+
+            case VIEW_OPEN_FILE:
+                if (openFileBrowserState) {
+                    moveFilepathBrowserSelection(openFileBrowserState, delta);
+                }
+                break;
+
+            case VIEW_CONFIRM_EXIT:
+                confirmIndex += delta;
+                if (confirmIndex < 0) confirmIndex = 0;
+                if (confirmIndex >= confirmItems.length) confirmIndex = confirmItems.length - 1;
+                break;
+
+            case VIEW_CONFIRM_NORMALIZE:
+                normalizeIndex += (delta > 0 ? 1 : -1);
+                if (normalizeIndex < 0) normalizeIndex = 0;
+                if (normalizeIndex >= normalizeItems.length) normalizeIndex = normalizeItems.length - 1;
+                break;
+
+            case VIEW_CONFIRM_SAVE:
+                saveIndex += (delta > 0 ? 1 : -1);
+                if (saveIndex < 0) saveIndex = 0;
+                if (saveIndex >= saveItems.length) saveIndex = saveItems.length - 1;
+                break;
+
+            case VIEW_TRIM:
+                /* Adjust selected marker: shift = 1 sample, normal = coarse */
+                adjustMarker(selectedField, shiftHeld ? delta : delta * getCoarseStep());
+                showJogStatus("Sel:" + formatSelDuration());
+                refreshWaveform();
+                break;
+
+            case VIEW_LOOP:
+                /* Adjust selected marker: shift = 1 sample, normal = coarse */
+                adjustMarker(loopSelectedField, shiftHeld ? delta : delta * getLoopCoarseStep());
+                seamWaveformDirty = true;
+                showJogStatus(loopSelectedField === 0 ? "Pt:" + formatTime(startSample) : "End:" + formatTime(endSample));
+                break;
+        }
+        return;
+    }
+
+    /* Jog click */
+    if (cc === CC_JOG_CLICK && value > 0) {
+        switch (currentView) {
+            case VIEW_MODE_MENU:
+                menuSelect();
+                break;
+
+            case VIEW_CONFIRM_EXIT:
+                confirmSelect();
+                break;
+
+            case VIEW_CONFIRM_NORMALIZE:
+                normalizeSelect();
+                break;
+
+            case VIEW_CONFIRM_SAVE:
+                saveSelect();
+                break;
+
+            case VIEW_TRIM:
+                /* Toggle selected field */
+                selectedField = selectedField === 0 ? 1 : 0;
+                showStatus(selectedField === 0 ? "Start" : "End", 30);
+                break;
+
+            case VIEW_LOOP:
+                /* Toggle loop point / end field */
+                loopSelectedField = loopSelectedField === 0 ? 1 : 0;
+                showStatus(loopSelectedField === 0 ? "Loop Point" : "Loop End", 30);
+                break;
+
+            case VIEW_OPEN_FILE:
+                if (openFileBrowserState) {
+                    var result = activateFilepathBrowserItem(openFileBrowserState);
+                    if (result.action === "open") {
+                        refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+                    } else if (result.action === "select") {
+                        host_module_set_param("file_path", result.value);
+                        refreshFileInfo();
+                        waveformDirty = true;
+                        refreshWaveform();
+                        refreshState();
+                        openFileBrowserState = null;
+                        switchView(VIEW_TRIM);
+                    }
+                }
+                break;
+        }
+        return;
+    }
+
+    /* E1 turn: adjust start marker */
+    if (cc === CC_E1) {
+        var delta = decodeDelta(value);
+        if (delta === 0) return;
+
+        if (currentView === VIEW_TRIM) {
+            var step = shiftHeld ? 1 : getCoarseStep();
+            adjustMarker(0, delta * step);
+            showKnobStatus(0, shiftHeld ? "S:" + startSample : "Sel:" + formatSelDuration());
+            refreshWaveform();
+        } else if (currentView === VIEW_LOOP) {
+            var step = shiftHeld ? 1 : getLoopCoarseStep();
+            adjustMarker(0, delta * step);
+            seamWaveformDirty = true;
+            showKnobStatus(0, shiftHeld ? "S:" + startSample : "Pt:" + formatTime(startSample));
+        }
+        return;
+    }
+
+    /* E2 turn: adjust end marker */
+    if (cc === CC_E2) {
+        var delta = decodeDelta(value);
+        if (delta === 0) return;
+
+        if (currentView === VIEW_TRIM) {
+            var step = shiftHeld ? 1 : getCoarseStep();
+            adjustMarker(1, delta * step);
+            showKnobStatus(1, shiftHeld ? "E:" + endSample : "Sel:" + formatSelDuration());
+            refreshWaveform();
+        } else if (currentView === VIEW_LOOP) {
+            var step = shiftHeld ? 1 : getLoopCoarseStep();
+            adjustMarker(1, delta * step);
+            seamWaveformDirty = true;
+            showKnobStatus(1, shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample));
+        }
+        return;
+    }
+
+    /* E3 turn: zoom (normal) or vertical scale (shift) */
+    if (cc === CC_E3) {
+        var delta = decodeDelta(value);
+        if (delta === 0) return;
+
+        if (currentView === VIEW_TRIM) {
+            if (shiftHeld) {
+                /* Shift+E3: vertical waveform scale */
+                vScale *= Math.pow(2, delta * VSCALE_STEP);
+                if (vScale < VSCALE_MIN) vScale = VSCALE_MIN;
+                if (vScale > VSCALE_MAX) vScale = VSCALE_MAX;
+                if (vScale > 0.9 && vScale < 1.1) vScale = 1.0;
+                showKnobStatus(2, "Scale:" + vScale.toFixed(1) + "x");
+            } else {
+                /* E3: horizontal zoom */
+                var wasZero = (zoomLevel <= 0);
+                zoomLevel += delta * ZOOM_STEP;
+                if (zoomLevel < 0) zoomLevel = 0;
+                if (zoomLevel > ZOOM_MAX) zoomLevel = ZOOM_MAX;
+
+                if (wasZero && zoomLevel > 0) {
+                    zoomCenter = selectedField === 0 ? startSample : endSample;
+                }
+                if (zoomLevel <= 0) {
+                    showKnobStatus(2, "Zoom: Full");
+                } else {
+                    var zoomFactor = Math.pow(2, zoomLevel);
+                    showKnobStatus(2, "Zoom:" + zoomFactor.toFixed(1) + "x");
+                }
+                syncZoomToDsp();
+            }
+        } else if (currentView === VIEW_LOOP) {
+            if (shiftHeld) {
+                /* Shift+E3: vertical waveform scale */
+                vScale *= Math.pow(2, delta * VSCALE_STEP);
+                if (vScale < VSCALE_MIN) vScale = VSCALE_MIN;
+                if (vScale > VSCALE_MAX) vScale = VSCALE_MAX;
+                if (vScale > 0.9 && vScale < 1.1) vScale = 1.0;
+                showKnobStatus(2, "Scale:" + vScale.toFixed(1) + "x");
+            } else {
+                /* E3: seam zoom (negate: CW = zoom in = fewer samples) */
+                seamZoomLevel -= delta * SEAM_ZOOM_STEP;
+                if (seamZoomLevel < 0) seamZoomLevel = 0;
+                if (seamZoomLevel > ZOOM_MAX) seamZoomLevel = ZOOM_MAX;
+                seamWaveformDirty = true;
+                var seamFactor = Math.pow(2, seamZoomLevel);
+                showKnobStatus(2, "Zoom:" + seamFactor.toFixed(1) + "x");
+            }
+        }
+        return;
+    }
+
+    /* E4 turn: adjust gain | Shift+E4 press: normalize confirm */
+    if (cc === CC_E4) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            if (shiftHeld) {
+                /* Shift+E4: show normalize confirm overlay */
+                normalizeIndex = 0;
+                switchView(VIEW_CONFIRM_NORMALIZE);
+            } else {
+                var delta = decodeDelta(value);
+                if (delta === 0) return;
+                gainDb += delta * GAIN_STEP;
+                if (gainDb < GAIN_MIN) gainDb = GAIN_MIN;
+                if (gainDb > GAIN_MAX) gainDb = GAIN_MAX;
+                host_module_set_param("gain_db", gainDb.toFixed(1));
+                showKnobStatus(3, "Gain:" + formatDb(gainDb));
+                invalidateWaveform();
+            }
+        }
+        return;
+    }
+}
+
+/**
+ * Handle note messages (pads and encoder touch events).
+ */
+function handleNote(note, velocity) {
+    /* Pad press/release: audition (hold to play, release to stop).
+     * Only the most recently pressed pad owns playback — releasing
+     * an earlier pad while a newer one is held does nothing. */
+    if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            if (velocity > 0) {
+                setLED(note, PAD_COLOR_PLAY);
+                activePadNote = note;
+                startPlayback();
+                showStatus(shiftHeld ? "Play All" : "Play Sel", 20);
+            } else {
+                setLED(note, PAD_COLOR_DIM);
+                if (note === activePadNote) {
+                    activePadNote = -1;
+                    stopPlayback();
+                }
+            }
+        }
+        return;
+    }
+
+    /* Knob touch tracking — persist status while knob is held */
+    if (note >= TOUCH_NOTE_MIN && note <= TOUCH_NOTE_MAX) {
+        var ki = note - TOUCH_NOTE_MIN;
+        if (velocity > 0) {
+            knobTouched[ki] = true;
+            pushTouchOrder(ki);
+        } else {
+            knobTouched[ki] = false;
+            /* Remove from touch order */
+            for (var t = 0; t < knobTouchOrder.length; t++) {
+                if (knobTouchOrder[t] === ki) {
+                    knobTouchOrder.splice(t, 1);
+                    break;
+                }
+            }
+            knobStatusMsg[ki] = "";
+        }
+        return;
+    }
+}
+
+/* ============ Exported Entry Points ============ */
+
+globalThis.init = function() {
+    refreshFileInfo();
+    refreshWaveform();
+    refreshState();
+    currentView = VIEW_TRIM;
+    selectedField = 0;
+    host_module_set_param("mode", "0");
+};
+
+globalThis.tick = function() {
+    /* Progressive LED init */
+    if (ledInitPending) {
+        initLedsStep();
+        if (!ledInitPending) {
+            /* Init just finished — sync LEDs to current state */
+            updateLeds();
+        }
+    }
+
+    /* Flush queued play/stop command — issued here in tick() so it's the
+     * last set_param in the frame, after encoder flush has completed.
+     * This prevents knob params from overwriting the play command. */
+    if (pendingPlay !== "") {
+        if (pendingPlay === "stop") {
+            host_module_set_param("stop", "1");
+        } else {
+            host_module_set_param("play", pendingPlay);
+        }
+        pendingPlay = "";
+    }
+
+    /* Poll playback state if playing */
+    if (playing) {
+        var posRaw = host_module_get_param("play_pos");
+        if (posRaw) playPos = parseInt(posRaw, 10) || 0;
+
+        var playingRaw = host_module_get_param("playing");
+        if (playingRaw === "0" || playingRaw === "false") {
+            playing = false;
+        }
+    }
+
+    /* Decay status message timer */
+    if (statusTimer > 0) {
+        statusTimer--;
+        if (statusTimer <= 0) {
+            statusMsg = "";
+        }
+    }
+
+    /* Decay jog virtual touch timer */
+    if (jogHeldTimer > 0) {
+        jogHeldTimer--;
+        if (jogHeldTimer <= 0) {
+            jogStatusMsg = "";
+            /* Remove jog from touch order */
+            for (var t = 0; t < knobTouchOrder.length; t++) {
+                if (knobTouchOrder[t] === JOG_ID) {
+                    knobTouchOrder.splice(t, 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Draw current view */
+    switch (currentView) {
+        case VIEW_MODE_MENU:
+            drawModeMenu();
+            break;
+        case VIEW_TRIM:
+            drawTrimView();
+            break;
+        case VIEW_LOOP:
+            drawLoopView();
+            break;
+        case VIEW_CONFIRM_EXIT:
+            drawConfirmExit();
+            break;
+        case VIEW_CONFIRM_NORMALIZE:
+            drawConfirmNormalize();
+            break;
+        case VIEW_CONFIRM_SAVE:
+            drawConfirmSave();
+            break;
+        case VIEW_OPEN_FILE:
+            drawOpenFileBrowser();
+            break;
+    }
+};
+
+globalThis.onMidiMessageInternal = function(data) {
+    var status = data[0] & 0xF0;
+    var d1 = data[1];
+    var d2 = data[2];
+
+    if (status === 0xB0) {
+        /* CC message */
+        handleCC(d1, d2);
+    } else if (status === 0x90) {
+        /* Note on */
+        handleNote(d1, d2);
+    } else if (status === 0x80) {
+        /* Note off - treat as touch release */
+        handleNote(d1, 0);
+    }
+};
