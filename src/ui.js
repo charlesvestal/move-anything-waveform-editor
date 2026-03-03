@@ -217,7 +217,7 @@ var normalizeIndex = 0;
 
 /* Confirm save overlay */
 var saveItemsNormal = ["Overwrite", "Cancel"];
-var saveItemsSlice = ["Drum Preset", "Cancel"];
+var saveItemsSlice = ["Slices", "Drum Preset", "Cancel"];
 var saveItems = saveItemsNormal;
 var saveIndex = 0;
 var saveReturnView = VIEW_TRIM; /* View to return to after save/cancel */
@@ -1327,18 +1327,18 @@ function drawConfirmSave() {
     /* Info: show filename */
     printCentered(18, truncate(fileName, 20));
 
-    /* Options */
-    var startY = 30;
-    var itemH = 14;
+    /* Options — compact line height so 4 items fit */
+    var startY = 28;
+    var itemH = saveItems.length > 3 ? 9 : 14;
 
     for (var i = 0; i < saveItems.length; i++) {
         var y = startY + i * itemH;
 
         if (i === saveIndex) {
             fill_rect(0, y, SCREEN_W, itemH, 1);
-            print(8, y + 3, saveItems[i], 0);
+            print(8, y + 1, saveItems[i], 0);
         } else {
-            print(8, y + 3, saveItems[i], 1);
+            print(8, y + 1, saveItems[i], 1);
         }
     }
 }
@@ -1522,15 +1522,17 @@ function normalizeSelect() {
  * Handle confirm save selection.
  */
 function saveSelect() {
-    debugLog("SAVE_SELECT: items=" + (saveItems === saveItemsSlice ? "slice" : "normal") + " idx=" + saveIndex);
     if (saveItems === saveItemsSlice) {
         switch (saveIndex) {
-            case 0: /* Drum Preset */
-                debugLog("SAVE_SELECT: calling saveDrumRackPreset");
+            case 0: /* Slices */
+                exportSlicedWavs();
+                switchView(saveReturnView);
+                break;
+            case 1: /* Drum Preset */
                 saveDrumRackPreset();
                 switchView(saveReturnView);
                 break;
-            case 1: /* Cancel */
+            case 2: /* Cancel */
                 switchView(saveReturnView);
                 break;
         }
@@ -1689,6 +1691,78 @@ function doExport() {
 }
 
 /**
+ * Export each slice as an individual WAV file into a subdirectory.
+ * Output: <sampleDir>/<basename>-sliced/<basename>_s1.wav, _s2.wav, etc.
+ * Uses the DSP export mechanism: set markers → sync → export → copy result → rename.
+ */
+function exportSlicedWavs() {
+    if (!openedFilePath || !fileName || totalFrames <= 0) {
+        showStatus("No file", 60);
+        return;
+    }
+    if (typeof host_system_cmd !== "function") {
+        showStatus("No cmd API", 60);
+        return;
+    }
+
+    var numSlices = Math.min(sliceCount, 16);
+    if (numSlices < 1) {
+        showStatus("No slices", 60);
+        return;
+    }
+
+    /* Derive paths */
+    var baseName = fileName.replace(/\.wav$/i, "");
+    var sampleDir = openedFilePath.substring(0, openedFilePath.lastIndexOf("/"));
+    var sliceDir = sampleDir + "/" + baseName + "-sliced";
+
+    /* Create output directory */
+    if (typeof host_ensure_dir === "function") {
+        host_ensure_dir(sliceDir);
+    }
+
+    /* Save current markers so we can restore them */
+    var savedStart = startSample;
+    var savedEnd = endSample;
+
+    var exported = 0;
+    for (var i = 0; i < numSlices; i++) {
+        /* Set markers to this slice's boundaries */
+        startSample = sliceBoundaries[i];
+        endSample = sliceBoundaries[i + 1];
+        syncMarkersToDs();
+        host_module_get_param("dirty"); /* sync barrier */
+
+        /* Trigger export — DSP writes to <baseName>_edit.wav in the sample dir */
+        host_module_set_param("export", "1");
+        var result = host_module_get_param("copy_result");
+
+        /* The exported file is always <sampleDir>/<baseName>_edit.wav */
+        var editPath = sampleDir + "/" + baseName + "_edit.wav";
+        var sliceName = baseName + "_s" + (i + 1) + ".wav";
+        var targetPath = sliceDir + "/" + sliceName;
+
+        /* Move exported file to final destination */
+        var cpResult = host_system_cmd('mv "' + editPath + '" "' + targetPath + '"');
+        if (cpResult === 0) {
+            exported++;
+        }
+    }
+
+    /* Restore original markers */
+    startSample = savedStart;
+    endSample = savedEnd;
+    syncMarkersToDs();
+
+    if (exported > 0) {
+        showStatus(exported + " slices saved", 90);
+        announce("Exported " + exported + " slices");
+    } else {
+        showStatus("Export failed", 60);
+    }
+}
+
+/**
  * Build a default drumCell parameter block for a slice.
  */
 function buildDrumCellParams(playbackStart, playbackLength) {
@@ -1744,7 +1818,6 @@ function buildDrumCellParams(playbackStart, playbackLength) {
  * Up to 16 slices, each mapped to a pad (MIDI notes 36-51).
  */
 function saveDrumRackPreset() {
-    debugLog("DRUM_SAVE: start fileName=" + fileName + " frames=" + totalFrames + " path=" + openedFilePath);
     if (!fileName || totalFrames <= 0) {
         showStatus("No file", 60);
         return;
