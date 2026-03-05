@@ -44,7 +44,7 @@ import {
     MoveLeft, MoveRight, MoveDown, MoveUp,
     MovePads,
     MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4,
-    White, Black, DarkGrey, LightGrey,
+    White, Black, DarkGrey, LightGrey, BrightRed,
     WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright
 } from '/data/UserData/move-anything/shared/constants.mjs';
 
@@ -182,7 +182,14 @@ var loopSelectedField = 0;
 /* Slice state */
 var SLICE_MODE_EVEN = 0;
 var SLICE_MODE_AUTO = 1;
+var SLICE_MODE_LAZY = 2;
 var sliceMode = SLICE_MODE_EVEN;
+
+/* Lazy chop sub-modes */
+var LAZY_SUB_CHOP = 0;
+var LAZY_SUB_PLAY = 1;
+var lazySub = LAZY_SUB_CHOP;
+var lazyChopping = false;
 var sliceCount = 1;
 var sliceThreshold = 50;
 var sliceBoundaries = [];
@@ -404,13 +411,16 @@ function showStatus(msg, frames) {
  */
 function getKnobLabel(knobIndex) {
     if (knobIndex === 0) {
-        if (currentView === VIEW_TRIM) return "Start:" + formatTime(startSample);
-        if (currentView === VIEW_LOOP) return "Pt:" + formatTime(startSample);
+        if (currentView === VIEW_TRIM) return shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample);
+        if (currentView === VIEW_LOOP) return shiftHeld ? "S:" + startSample : "Pt:" + formatTime(startSample);
         if (currentView === VIEW_SLICE) return "Start:" + formatTime(sliceBoundaries[selectedSlice]);
     } else if (knobIndex === 1) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "End:" + formatTime(endSample);
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample);
         if (currentView === VIEW_SLICE) return "End:" + formatTime(sliceBoundaries[selectedSlice + 1]);
     } else if (knobIndex === 2) {
+        if (shiftHeld && (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_SLICE)) {
+            return "Scale:" + vScale.toFixed(1) + "x";
+        }
         if (currentView === VIEW_TRIM || currentView === VIEW_SLICE) {
             if (zoomLevel <= 0) return "Zoom: Full";
             return "Zoom:" + Math.pow(2, zoomLevel).toFixed(1) + "x";
@@ -419,7 +429,9 @@ function getKnobLabel(knobIndex) {
             return "Zoom:" + Math.pow(2, seamZoomLevel).toFixed(1) + "x";
         }
     } else if (knobIndex === 3) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "Gain:" + formatDb(gainDb);
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+            return shiftHeld ? "Normalize" : "Gain:" + formatDb(gainDb);
+        }
     }
     return "";
 }
@@ -736,7 +748,13 @@ function parseWaveformData(raw) {
  * Recompute slice boundaries based on current mode.
  */
 function recomputeSliceBoundaries() {
-    if (sliceMode === SLICE_MODE_EVEN) {
+    if (sliceMode === SLICE_MODE_LAZY) {
+        /* Lazy: keep existing boundaries; init single slice if empty */
+        if (sliceBoundaries.length < 2) {
+            sliceBoundaries = [sliceRegionStart, sliceRegionEnd];
+            sliceCount = 1;
+        }
+    } else if (sliceMode === SLICE_MODE_EVEN) {
         var regionLen = sliceRegionEnd - sliceRegionStart;
         sliceBoundaries = [];
         for (var i = 0; i <= sliceCount; i++) {
@@ -836,12 +854,38 @@ function selectSlice(idx) {
  */
 function updateSlicePadLeds() {
     if (ledInitPending) return;
+    if (sliceMode === SLICE_MODE_LAZY && lazySub === LAZY_SUB_CHOP) {
+        updateLazyChopPadLeds();
+        return;
+    }
     for (var i = 0; i < 32; i++) {
         var padNote = PAD_NOTE_MIN + i;
         var sliceIdx = slicePadOffset + i;
         if (sliceIdx < sliceCount) {
             if (sliceIdx === selectedSlice) {
                 setLED(padNote, White);
+            } else {
+                setLED(padNote, PAD_COLOR_DIM);
+            }
+        } else {
+            setLED(padNote, Black);
+        }
+    }
+}
+
+/**
+ * Pad LEDs for lazy chop sub-mode.
+ */
+function updateLazyChopPadLeds() {
+    for (var i = 0; i < 32; i++) {
+        var padNote = PAD_NOTE_MIN + i;
+        if (i === 0) {
+            /* Pad 1 = red chop trigger */
+            setLED(padNote, BrightRed);
+        } else if (lazyChopping && i < sliceCount) {
+            /* Completed slice pads */
+            if (i === sliceCount - 1) {
+                setLED(padNote, White); /* current active slice */
             } else {
                 setLED(padNote, PAD_COLOR_DIM);
             }
@@ -1255,9 +1299,11 @@ function drawSliceView() {
         printCentered(54, footerStatus);
     } else {
         /* Build footer items based on slice menu */
-        var modeLabel = sliceMode === SLICE_MODE_EVEN ? "Even" : "Auto";
+        var modeLabel = sliceMode === SLICE_MODE_EVEN ? "Even" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Lazy");
         var countLabel;
-        if (sliceMode === SLICE_MODE_EVEN) {
+        if (sliceMode === SLICE_MODE_LAZY) {
+            countLabel = lazySub === LAZY_SUB_CHOP ? "Chop" : "Play";
+        } else if (sliceMode === SLICE_MODE_EVEN) {
             countLabel = "" + sliceCount;
         } else {
             countLabel = "T:" + sliceThreshold;
@@ -1269,14 +1315,34 @@ function drawSliceView() {
         }
         var timeLabel = formatTime(startSample);
 
-        /* Highlight the focused menu item with [brackets] */
-        var parts = [];
-        parts.push(sliceMenuIndex === 0 ? "[" + modeLabel + "]" : modeLabel);
-        parts.push(sliceMenuIndex === 1 ? "[" + countLabel + "]" : countLabel);
-        parts.push(sliceMenuIndex === 2 ? "[" + selLabel + "]" : selLabel);
-
-        var footer = parts.join(" ") + " " + timeLabel;
-        print(0, 54, footer, 1);
+        /* Draw footer items with visual distinction:
+         * - Focused (navigating): [brackets]
+         * - Editing (active): inverse highlight (filled rect + dark text) */
+        var labels = [modeLabel, countLabel, selLabel];
+        var CHAR_W = 6; /* 5px char + 1px gap */
+        var footerY = 54;
+        var x = 0;
+        for (var fi = 0; fi < 3; fi++) {
+            var label = labels[fi];
+            var isFocused = (fi === sliceMenuIndex);
+            var isEditing = isFocused && sliceMenuEditing;
+            if (isEditing) {
+                /* Inverse: filled rect behind text */
+                var tw = label.length * CHAR_W + 2;
+                fill_rect(x, footerY - 1, tw, 9, 1);
+                print(x + 1, footerY, label, 0);
+                x += tw + 2;
+            } else if (isFocused) {
+                /* Brackets to show focus */
+                print(x, footerY, "[" + label + "]", 1);
+                x += (label.length + 2) * CHAR_W + 2;
+            } else {
+                print(x, footerY, label, 1);
+                x += label.length * CHAR_W + 2;
+            }
+        }
+        /* Append time label */
+        print(x, footerY, timeLabel, 1);
     }
 }
 
@@ -1428,6 +1494,8 @@ function switchView(view) {
         slicePadOffset = 0;
         sliceMenuIndex = 0;
         sliceMenuEditing = false;
+        lazyChopping = false;
+        if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
         recomputeSliceBoundaries();
         selectSlice(0);
         syncMarkersToDs();
@@ -1973,11 +2041,15 @@ function saveDrumRackPreset() {
 
     var numSlices = Math.min(sliceCount, 16);
 
-    /* Build drum rack chains — one per slice */
+    /* Build drum rack chains — always 16 pads for Move compatibility.
+     * Pads beyond the slice count get the last slice's sample region
+     * with speaker off (muted) so the preset loads correctly. */
     var drumChains = [];
-    for (var i = 0; i < numSlices; i++) {
-        var sliceStart = sliceBoundaries[i] / totalFrames;
-        var sliceLen = (sliceBoundaries[i + 1] - sliceBoundaries[i]) / totalFrames;
+    for (var i = 0; i < 16; i++) {
+        var hasSlice = (i < numSlices);
+        var si = hasSlice ? i : numSlices - 1; /* fallback to last slice */
+        var sliceStart = sliceBoundaries[si] / totalFrames;
+        var sliceLen = (sliceBoundaries[si + 1] - sliceBoundaries[si]) / totalFrames;
 
         drumChains.push({
             "name": "",
@@ -1994,7 +2066,7 @@ function saveDrumRackPreset() {
             "mixer": {
                 "pan": 0.0,
                 "solo-cue": false,
-                "speakerOn": true,
+                "speakerOn": hasSlice,
                 "volume": 0.0,
                 "sends": [{ "isEnabled": true, "amount": -70.0 }]
             },
@@ -2175,11 +2247,26 @@ function handleCC(cc, value) {
                 attemptExit();
                 break;
             case VIEW_SLICE:
-                /* Restore selection spanning all slices */
-                startSample = sliceBoundaries[0];
-                endSample = sliceBoundaries[sliceCount];
-                syncMarkersToDs();
-                switchView(VIEW_TRIM);
+                if (sliceMode === SLICE_MODE_LAZY && lazyChopping) {
+                    /* End chop session early */
+                    stopPlayback();
+                    /* Trim last boundary to current playPos if mid-playback */
+                    if (playPos > sliceBoundaries[sliceCount - 1] && playPos < sliceRegionEnd) {
+                        sliceBoundaries[sliceCount] = playPos;
+                    }
+                    lazyChopping = false;
+                    lazySub = LAZY_SUB_PLAY;
+                    selectedSlice = 0;
+                    selectSlice(0);
+                    updateSlicePadLeds();
+                    showStatus("Chop done", 30);
+                } else {
+                    /* Restore selection spanning all slices */
+                    startSample = sliceBoundaries[0];
+                    endSample = sliceBoundaries[sliceCount];
+                    syncMarkersToDs();
+                    switchView(VIEW_TRIM);
+                }
                 break;
             case VIEW_MODE_MENU:
                 attemptExit();
@@ -2302,6 +2389,10 @@ function handleCC(cc, value) {
             if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
                 switchView(VIEW_SLICE);
             } else if (currentView === VIEW_SLICE) {
+                if (lazyChopping) {
+                    stopPlayback();
+                    lazyChopping = false;
+                }
                 /* Restore selection spanning all slices */
                 startSample = sliceBoundaries[0];
                 endSample = sliceBoundaries[sliceCount];
@@ -2468,18 +2559,44 @@ function handleCC(cc, value) {
                 break;
 
             case VIEW_SLICE:
+                if (lazyChopping) break; /* No jog edits while chopping */
                 if (sliceMenuEditing) {
                     /* Editing the focused parameter */
                     if (sliceMenuIndex === 0) {
                         /* Toggle mode */
-                        sliceMode = (sliceMode === SLICE_MODE_EVEN) ? SLICE_MODE_AUTO : SLICE_MODE_EVEN;
+                        /* Cycle: Even -> Auto -> Lazy -> Even */
+                        if (delta > 0) {
+                            if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_AUTO;
+                            else if (sliceMode === SLICE_MODE_AUTO) sliceMode = SLICE_MODE_LAZY;
+                            else sliceMode = SLICE_MODE_EVEN;
+                        } else {
+                            if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_LAZY;
+                            else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_AUTO;
+                            else sliceMode = SLICE_MODE_EVEN;
+                        }
+                        if (sliceMode === SLICE_MODE_LAZY) {
+                            lazySub = LAZY_SUB_CHOP;
+                            lazyChopping = false;
+                        }
+                        /* Reset to full region when switching modes */
+                        sliceCount = 1;
+                        selectedSlice = 0;
+                        sliceBoundaries = [];
+                        slicePadOffset = 0;
                         recomputeSliceBoundaries();
-                        selectSlice(selectedSlice);
+                        selectSlice(0);
                         syncMarkersToDs();
                         updateSlicePadLeds();
-                        showJogStatus(sliceMode === SLICE_MODE_EVEN ? "Even" : "Auto");
+                        var modeNames = ["Even", "Auto", "Lazy"];
+                        announce(modeNames[sliceMode]);
                     } else if (sliceMenuIndex === 1) {
-                        if (sliceMode === SLICE_MODE_EVEN) {
+                        if (sliceMode === SLICE_MODE_LAZY) {
+                            /* Toggle Chop / Play sub-mode */
+                            lazySub = (lazySub === LAZY_SUB_CHOP) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
+                            lazyChopping = false;
+                            updateSlicePadLeds();
+                            announce(lazySub === LAZY_SUB_CHOP ? "Chop" : "Play");
+                        } else if (sliceMode === SLICE_MODE_EVEN) {
                             /* Adjust slice count */
                             sliceCount += (delta > 0 ? 1 : -1);
                             if (sliceCount < 1) sliceCount = 1;
@@ -2488,7 +2605,7 @@ function handleCC(cc, value) {
                             selectSlice(selectedSlice);
                             syncMarkersToDs();
                             updateSlicePadLeds();
-                            showJogStatus("Slices:" + sliceCount);
+                            announce("Slices:" + sliceCount);
                         } else {
                             /* Adjust auto threshold */
                             sliceThreshold += (delta > 0 ? 1 : -1) * 5;
@@ -2498,7 +2615,7 @@ function handleCC(cc, value) {
                             selectSlice(selectedSlice);
                             syncMarkersToDs();
                             updateSlicePadLeds();
-                            showJogStatus("Thresh:" + sliceThreshold);
+                            announce("Thresh:" + sliceThreshold);
                         }
                     } else if (sliceMenuIndex === 2) {
                         /* Cycle selected slice */
@@ -2514,14 +2631,15 @@ function handleCC(cc, value) {
                         }
                         syncMarkersToDs();
                         updateSlicePadLeds();
-                        showJogStatus("Sel:" + (selectedSlice + 1) + "/" + sliceCount);
+                        announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
                     }
                 } else {
                     /* Navigate between menu items */
                     sliceMenuIndex += (delta > 0 ? 1 : -1);
                     if (sliceMenuIndex < 0) sliceMenuIndex = 0;
                     if (sliceMenuIndex > 2) sliceMenuIndex = 2;
-                    var itemNames = ["Mode", sliceMode === SLICE_MODE_EVEN ? "Count" : "Thresh", "Select"];
+                    var param2Name = sliceMode === SLICE_MODE_LAZY ? "Sub" : (sliceMode === SLICE_MODE_EVEN ? "Count" : "Thresh");
+                    var itemNames = ["Mode", param2Name, "Select"];
                     announce(itemNames[sliceMenuIndex]);
                 }
                 break;
@@ -2564,10 +2682,11 @@ function handleCC(cc, value) {
                 /* Toggle editing of current menu item */
                 sliceMenuEditing = !sliceMenuEditing;
                 if (sliceMenuEditing) {
-                    var editNames = ["Editing Mode", "Editing " + (sliceMode === SLICE_MODE_EVEN ? "Count" : "Threshold"), "Editing Slice"];
-                    showStatus(editNames[sliceMenuIndex], 30);
+                    var edit2Name = sliceMode === SLICE_MODE_LAZY ? "Sub-mode" : (sliceMode === SLICE_MODE_EVEN ? "Count" : "Threshold");
+                    var editNames = ["Editing Mode", "Editing " + edit2Name, "Editing Slice"];
+                    announce(editNames[sliceMenuIndex]);
                 } else {
-                    showStatus("Navigate", 20);
+                    announce("Navigate");
                 }
                 break;
 
@@ -2613,7 +2732,7 @@ function handleCC(cc, value) {
             adjustMarker(0, delta * step);
             seamWaveformDirty = true;
             showKnobStatus(0, shiftHeld ? "S:" + startSample : "Pt:" + formatTime(startSample));
-        } else if (currentView === VIEW_SLICE) {
+        } else if (currentView === VIEW_SLICE && !lazyChopping) {
             /* E1: Move slice start boundary */
             var step = shiftHeld ? 1 : getCoarseStep();
             var bIdx = selectedSlice; /* boundary index for start of selected slice */
@@ -2647,7 +2766,7 @@ function handleCC(cc, value) {
             adjustMarker(1, delta * step);
             seamWaveformDirty = true;
             showKnobStatus(1, shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample));
-        } else if (currentView === VIEW_SLICE) {
+        } else if (currentView === VIEW_SLICE && !lazyChopping) {
             /* E2: Move slice end boundary */
             var step = shiftHeld ? 1 : getCoarseStep();
             var bIdx = selectedSlice + 1; /* boundary index for end of selected slice */
@@ -2786,20 +2905,49 @@ function handleNote(note, velocity) {
             }
         } else if (currentView === VIEW_SLICE) {
             var padIdx = note - PAD_NOTE_MIN;
-            var sliceIdx = slicePadOffset + padIdx;
-            if (sliceIdx < sliceCount) {
-                if (velocity > 0) {
-                    selectSlice(sliceIdx);
-                    updateSlicePadLeds();
-                    setLED(note, PAD_COLOR_PLAY);
-                    activePadNote = note;
-                    startPlayback();
-                    showStatus("Slice " + (sliceIdx + 1), 20);
-                } else {
-                    updateSlicePadLeds();
-                    if (note === activePadNote) {
-                        activePadNote = -1;
-                        stopPlayback();
+            if (sliceMode === SLICE_MODE_LAZY && lazySub === LAZY_SUB_CHOP) {
+                /* Lazy chop mode: pad 1 triggers chopping */
+                if (padIdx === 0 && velocity > 0) {
+                    if (!lazyChopping) {
+                        /* Start new chop session */
+                        sliceCount = 1;
+                        sliceBoundaries = [sliceRegionStart, sliceRegionEnd];
+                        startSample = sliceRegionStart;
+                        endSample = sliceRegionEnd;
+                        syncMarkersToDs();
+                        startPlayback();
+                        lazyChopping = true;
+                        selectedSlice = 0;
+                        updateLazyChopPadLeds();
+                        showStatus("Chopping", 30);
+                    } else {
+                        /* Add chop point at current play position */
+                        var insertIdx = sliceCount;
+                        sliceBoundaries.splice(insertIdx, 0, playPos);
+                        sliceCount = sliceBoundaries.length - 1;
+                        selectedSlice = sliceCount - 1;
+                        updateLazyChopPadLeds();
+                        showStatus("Slice " + sliceCount, 20);
+                    }
+                }
+                /* In chop mode, pad release does NOT stop playback */
+            } else {
+                /* Normal slice or lazy play mode: audition slices */
+                var sliceIdx = slicePadOffset + padIdx;
+                if (sliceIdx < sliceCount) {
+                    if (velocity > 0) {
+                        selectSlice(sliceIdx);
+                        updateSlicePadLeds();
+                        setLED(note, PAD_COLOR_PLAY);
+                        activePadNote = note;
+                        startPlayback();
+                        showStatus("Slice " + (sliceIdx + 1), 20);
+                    } else {
+                        updateSlicePadLeds();
+                        if (note === activePadNote) {
+                            activePadNote = -1;
+                            stopPlayback();
+                        }
                     }
                 }
             }
@@ -2883,6 +3031,15 @@ globalThis.tick = function() {
         var playingRaw = host_module_get_param("playing");
         if (playingRaw === "0" || playingRaw === "false") {
             playing = false;
+            if (lazyChopping) {
+                /* Sample reached end — finalize chop session */
+                lazyChopping = false;
+                lazySub = LAZY_SUB_PLAY;
+                selectedSlice = 0;
+                selectSlice(0);
+                updateSlicePadLeds();
+                showStatus("Chop done", 30);
+            }
         }
     }
 
