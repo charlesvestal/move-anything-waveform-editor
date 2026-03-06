@@ -2664,18 +2664,47 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Up/Down arrows — pad bank scrolling in slice mode */
+    /* Up/Down arrows in slice mode */
     if ((cc === CC_UP || cc === CC_DOWN) && value > 0) {
-        if (currentView === VIEW_SLICE && sliceCount > 32) {
-            if (cc === CC_DOWN) {
-                slicePadOffset = Math.max(0, slicePadOffset - 32);
-            } else {
-                slicePadOffset = Math.min(Math.floor((sliceCount - 1) / 32) * 32, slicePadOffset + 32);
+        if (currentView === VIEW_SLICE) {
+            if (shiftHeld && sliceCount > 32) {
+                /* Shift+Up/Down: pad bank scrolling (>32 slices) */
+                if (cc === CC_DOWN) {
+                    slicePadOffset = Math.max(0, slicePadOffset - 32);
+                } else {
+                    slicePadOffset = Math.min(Math.floor((sliceCount - 1) / 32) * 32, slicePadOffset + 32);
+                }
+                updateSlicePadLeds();
+                var bankNum = Math.floor(slicePadOffset / 32) + 1;
+                var totalBanks = Math.floor((sliceCount - 1) / 32) + 1;
+                announce("Pad bank " + bankNum + " of " + totalBanks);
+            } else if (cc === CC_DOWN) {
+                /* Down: split current slice at midpoint */
+                var splitStart = sliceBoundaries[selectedSlice];
+                var splitEnd = sliceBoundaries[selectedSlice + 1];
+                var mid = splitStart + Math.floor((splitEnd - splitStart) / 2);
+                if (mid > splitStart && mid < splitEnd) {
+                    sliceBoundaries.splice(selectedSlice + 1, 0, mid);
+                    sliceCount = sliceBoundaries.length - 1;
+                    selectSlice(selectedSlice);
+                    syncMarkersToDs();
+                    updateSlicePadLeds();
+                    showStatus("Split " + (selectedSlice + 1), 30);
+                    announce("Split slice " + (selectedSlice + 1) + ", " + sliceCount + " total");
+                }
+            } else if (cc === CC_UP) {
+                /* Up: merge current slice with previous (remove start boundary) */
+                if (selectedSlice > 0) {
+                    sliceBoundaries.splice(selectedSlice, 1);
+                    sliceCount = sliceBoundaries.length - 1;
+                    selectedSlice--;
+                    selectSlice(selectedSlice);
+                    syncMarkersToDs();
+                    updateSlicePadLeds();
+                    showStatus("Merge " + (selectedSlice + 1), 30);
+                    announce("Merged, slice " + (selectedSlice + 1) + " of " + sliceCount);
+                }
             }
-            updateSlicePadLeds();
-            var bankNum = Math.floor(slicePadOffset / 32) + 1;
-            var totalBanks = Math.floor((sliceCount - 1) / 32) + 1;
-            announce("Pad bank " + bankNum + " of " + totalBanks);
         }
         return;
     }

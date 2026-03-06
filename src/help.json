@@ -121,8 +121,12 @@
         "  audition)",
         "Left/Right: prev/next",
         "  slice",
-        "Up/Down: scroll pad",
-        "  banks (>32 slices)"
+        "Down: split slice at",
+        "  midpoint",
+        "Up: merge with previous",
+        "  slice",
+        "Shift+Up/Down: scroll",
+        "  pad banks (>32)"
       ]
     },
     {
