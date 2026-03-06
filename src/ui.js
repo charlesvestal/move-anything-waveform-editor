@@ -199,7 +199,7 @@ var LAZY_SUB_PLAY = 1;
 var lazySub = LAZY_SUB_CHOP;
 var lazyChopping = false;
 var sliceCount = 1;
-var sliceThreshold = 5.0;
+var sliceThreshold = 25.0;
 var sliceBoundaries = [];
 var selectedSlice = 0;
 var sliceRegionStart = 0;
@@ -307,6 +307,7 @@ function getSaveItemsSlice() {
 
 /* Loop state */
 var loopEnabled = false;
+var savedLoopState = false;
 
 /* Undo state */
 var hasUndo = false;
@@ -1618,6 +1619,12 @@ function switchView(view) {
         updateLeds();
         announce("Loop, " + fileName);
     } else if (view === VIEW_SLICE) {
+        /* Disable looping for slice audition */
+        savedLoopState = loopEnabled;
+        if (loopEnabled) {
+            loopEnabled = false;
+            host_module_set_param("play_loop", "0");
+        }
         /* Capture current selection as slice region */
         sliceRegionStart = startSample;
         sliceRegionEnd = endSample;
@@ -2200,20 +2207,16 @@ function saveDrumRackPreset() {
         return;
     }
 
-    /* Build sample URI from the file path used to open the file.
-     * openFilePath is set when a file is loaded via the browser. */
+    /* Build sample URI from file path (URL-encode spaces) */
     var sampleUri;
-    if (openedFilePath) {
-        var userLibPrefix = "/data/UserData/UserLibrary/";
-        if (openedFilePath.indexOf(userLibPrefix) === 0) {
-            sampleUri = "ableton:/user-library/" + openedFilePath.substring(userLibPrefix.length);
-        } else {
-            sampleUri = "ableton:/user-library/Samples/" + fileName;
-        }
+    var userLibPrefix = "/data/UserData/UserLibrary/";
+    var uriPath;
+    if (openedFilePath && openedFilePath.indexOf(userLibPrefix) === 0) {
+        uriPath = openedFilePath.substring(userLibPrefix.length);
     } else {
-        /* Fallback: assume file is in Samples */
-        sampleUri = "ableton:/user-library/Samples/" + fileName;
+        uriPath = "Samples/" + fileName;
     }
+    sampleUri = "ableton:/user-library/" + uriPath.split(" ").join("%20");
 
     var numSlices = Math.min(sliceCount, 16);
 
@@ -2435,8 +2438,7 @@ function handleCC(cc, value) {
         if (recordState === "ready") {
             recordState = "idle";
             setButtonLED(CC_REC, LED_OFF);
-            announce("Cancelled");
-            enterOpenFileBrowser();
+            host_module_exit();
             return;
         }
         switch (currentView) {
@@ -2617,7 +2619,11 @@ function handleCC(cc, value) {
                     lazyChopping = false;
                     announce("Chop stopped");
                 }
-                /* Restore selection spanning all slices */
+                /* Restore loop state and selection spanning all slices */
+                if (savedLoopState) {
+                    loopEnabled = true;
+                    host_module_set_param("play_loop", "1");
+                }
                 startSample = sliceBoundaries[0];
                 endSample = sliceBoundaries[sliceCount];
                 syncMarkersToDs();

@@ -6,6 +6,7 @@
  * waveform editor tool.
  *
  * V2 API only - instance-based for multi-instance support.
+ * Audio stored as interleaved stereo int16 (L,R,L,R,...).
  */
 
 #include <stdio.h>
@@ -54,8 +55,11 @@ typedef struct plugin_api_v2 {
 #define MAX_WAVEFORM_COLS 256
 #define NORMALIZE_TARGET_DB (-0.3f)
 
-/* Maximum audio duration: 10 minutes at 44100 Hz mono */
+/* Maximum audio duration: 10 minutes at 44100 Hz */
 #define MAX_AUDIO_FRAMES (MOVE_SAMPLE_RATE * 600)
+
+/* Samples per frame (stereo interleaved) */
+#define SAMPLES_PER_FRAME 2
 
 /* ============================================================================
  * Instance structure
@@ -69,14 +73,14 @@ typedef struct {
     int total_frames;
     float duration_secs;
 
-    int16_t *audio_data;        /* Mono PCM buffer */
-    int audio_frames;
+    int16_t *audio_data;        /* Stereo interleaved PCM buffer (L,R,L,R,...) */
+    int audio_frames;           /* Number of frames (each frame = 2 samples) */
     int16_t *undo_buffer;
     int undo_frames;
     int has_undo;
     int dirty;
 
-    int16_t *clipboard_data;    /* Clipboard buffer for copy/cut/paste */
+    int16_t *clipboard_data;    /* Clipboard buffer (stereo interleaved) */
     int clipboard_frames;
 
     int16_t waveform_min[MAX_WAVEFORM_COLS];
@@ -161,8 +165,8 @@ static void write_u32_le(uint8_t *p, uint32_t v) {
 
 /*
  * Load a WAV file into the instance.
- * Supports 16-bit PCM (format tag 1), mono or stereo.
- * Stereo is downmixed to mono by averaging L+R.
+ * Supports 16-bit PCM, 24-bit PCM, and 32-bit float, mono or stereo.
+ * Mono files are expanded to stereo. All formats converted to int16 stereo.
  * Returns 0 on success, -1 on error.
  */
 static int load_wav(instance_t *inst, const char *path) {
@@ -316,69 +320,75 @@ static int load_wav(instance_t *inst, const char *path) {
         return -1;
     }
 
-    /* Allocate mono audio buffer */
-    int16_t *audio = (int16_t *)malloc((size_t)total_frames * sizeof(int16_t));
+    /* Allocate stereo interleaved audio buffer */
+    int16_t *audio = (int16_t *)malloc((size_t)total_frames * SAMPLES_PER_FRAME * sizeof(int16_t));
     if (!audio) {
         snprintf(inst->load_error, sizeof(inst->load_error),
-                 "Out of memory allocating %d frames", total_frames);
+                 "Out of memory allocating %d stereo frames", total_frames);
         plugin_log(inst->load_error);
         free(file_data);
         return -1;
     }
 
-    /* Convert to mono int16 — handles PCM16, PCM24, and float32 */
+    /* Convert to stereo int16 — handles PCM16, PCM24, and float32 */
     if (audio_format == 3 && bits_per_sample == 32) {
-        /* IEEE float 32-bit (Move's native recording format) */
+        /* IEEE float 32-bit */
         const float *fsrc = (const float *)data_ptr;
         if (num_channels == 1) {
             for (int i = 0; i < total_frames; i++) {
                 float s = fsrc[i];
                 if (s > 1.0f) s = 1.0f;
                 if (s < -1.0f) s = -1.0f;
-                audio[i] = (int16_t)(s * 32767.0f);
+                int16_t v = (int16_t)(s * 32767.0f);
+                audio[i * 2]     = v;
+                audio[i * 2 + 1] = v;
             }
         } else {
             for (int i = 0; i < total_frames; i++) {
                 float left  = fsrc[i * 2];
                 float right = fsrc[i * 2 + 1];
-                float mix = (left + right) * 0.5f;
-                if (mix > 1.0f) mix = 1.0f;
-                if (mix < -1.0f) mix = -1.0f;
-                audio[i] = (int16_t)(mix * 32767.0f);
+                if (left > 1.0f) left = 1.0f;
+                if (left < -1.0f) left = -1.0f;
+                if (right > 1.0f) right = 1.0f;
+                if (right < -1.0f) right = -1.0f;
+                audio[i * 2]     = (int16_t)(left * 32767.0f);
+                audio[i * 2 + 1] = (int16_t)(right * 32767.0f);
             }
         }
     } else if (audio_format == 1 && bits_per_sample == 24) {
-        /* PCM 24-bit (common DAW export format) */
+        /* PCM 24-bit */
         const uint8_t *bsrc = (const uint8_t *)data_ptr;
-        int bytes_per_sample = 3 * num_channels;
+        int src_bytes_per_frame = 3 * num_channels;
         if (num_channels == 1) {
             for (int i = 0; i < total_frames; i++) {
                 const uint8_t *p = bsrc + i * 3;
                 int32_t s = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
-                if (s & 0x800000) s |= (int32_t)0xFF000000; /* Sign extend */
-                audio[i] = (int16_t)(s >> 8);
+                if (s & 0x800000) s |= (int32_t)0xFF000000;
+                int16_t v = (int16_t)(s >> 8);
+                audio[i * 2]     = v;
+                audio[i * 2 + 1] = v;
             }
         } else {
             for (int i = 0; i < total_frames; i++) {
-                const uint8_t *p = bsrc + i * bytes_per_sample;
+                const uint8_t *p = bsrc + i * src_bytes_per_frame;
                 int32_t left  = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16));
                 int32_t right = (int32_t)((uint32_t)p[3] | ((uint32_t)p[4] << 8) | ((uint32_t)p[5] << 16));
                 if (left & 0x800000)  left  |= (int32_t)0xFF000000;
                 if (right & 0x800000) right |= (int32_t)0xFF000000;
-                audio[i] = (int16_t)(((left >> 8) + (right >> 8)) / 2);
+                audio[i * 2]     = (int16_t)(left >> 8);
+                audio[i * 2 + 1] = (int16_t)(right >> 8);
             }
         }
     } else {
         /* PCM 16-bit */
         const int16_t *src = (const int16_t *)data_ptr;
         if (num_channels == 1) {
-            memcpy(audio, src, (size_t)total_frames * sizeof(int16_t));
-        } else {
             for (int i = 0; i < total_frames; i++) {
-                int left  = (int)src[i * 2];
-                int right = (int)src[i * 2 + 1];
-                audio[i] = (int16_t)((left + right) / 2);
+                audio[i * 2]     = src[i];
+                audio[i * 2 + 1] = src[i];
             }
+        } else {
+            memcpy(audio, src, (size_t)total_frames * SAMPLES_PER_FRAME * sizeof(int16_t));
         }
     }
 
@@ -401,7 +411,7 @@ static int load_wav(instance_t *inst, const char *path) {
     inst->dirty = 0;
 
     inst->sample_rate = (int)wav_sample_rate;
-    inst->channels = (int)num_channels;
+    inst->channels = 2; /* Always stereo internally */
     inst->total_frames = total_frames;
     inst->duration_secs = (float)total_frames / (float)wav_sample_rate;
 
@@ -423,7 +433,7 @@ static int load_wav(instance_t *inst, const char *path) {
     {
         char log_buf[256];
         snprintf(log_buf, sizeof(log_buf),
-                 "Loaded WAV: %d frames, %u Hz, %u ch -> mono",
+                 "Loaded WAV: %d frames, %u Hz, %u ch -> stereo int16",
                  total_frames, wav_sample_rate, num_channels);
         plugin_log(log_buf);
     }
@@ -432,7 +442,8 @@ static int load_wav(instance_t *inst, const char *path) {
 }
 
 /*
- * Write mono int16 PCM data as a WAV file.
+ * Write stereo int16 PCM data as a WAV file.
+ * data is interleaved stereo (L,R,L,R,...), num_frames frames.
  * Returns 0 on success, -1 on error.
  */
 static int write_wav(const char *path, const int16_t *data, int num_frames,
@@ -447,7 +458,7 @@ static int write_wav(const char *path, const int16_t *data, int num_frames,
         return -1;
     }
 
-    uint32_t data_size = (uint32_t)num_frames * 2; /* 16-bit mono */
+    uint32_t data_size = (uint32_t)num_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
     uint32_t file_size = 36 + data_size;
 
     uint8_t header[44];
@@ -461,10 +472,10 @@ static int write_wav(const char *path, const int16_t *data, int num_frames,
     memcpy(header + 12, "fmt ", 4);
     write_u32_le(header + 16, 16);          /* chunk size */
     write_u16_le(header + 20, 1);           /* PCM format */
-    write_u16_le(header + 22, 1);           /* mono */
+    write_u16_le(header + 22, 2);           /* stereo */
     write_u32_le(header + 24, (uint32_t)sample_rate);
-    write_u32_le(header + 28, (uint32_t)(sample_rate * 2)); /* byte rate */
-    write_u16_le(header + 32, 2);           /* block align */
+    write_u32_le(header + 28, (uint32_t)(sample_rate * SAMPLES_PER_FRAME * sizeof(int16_t))); /* byte rate */
+    write_u16_le(header + 32, SAMPLES_PER_FRAME * sizeof(int16_t)); /* block align */
     write_u16_le(header + 34, 16);          /* bits per sample */
 
     /* data chunk */
@@ -477,15 +488,16 @@ static int write_wav(const char *path, const int16_t *data, int num_frames,
         return -1;
     }
 
-    written = fwrite(data, sizeof(int16_t), (size_t)num_frames, f);
+    size_t total_samples = (size_t)num_frames * SAMPLES_PER_FRAME;
+    written = fwrite(data, sizeof(int16_t), total_samples, f);
     fclose(f);
 
-    if ((int)written != num_frames) return -1;
+    if (written != total_samples) return -1;
 
     {
         char log_buf[256];
         snprintf(log_buf, sizeof(log_buf),
-                 "Wrote WAV: %s (%d frames)", path, num_frames);
+                 "Wrote WAV: %s (%d frames, stereo 16-bit)", path, num_frames);
         plugin_log(log_buf);
     }
 
@@ -540,6 +552,7 @@ static void get_visible_range(const instance_t *inst,
 
 /*
  * Compute waveform overview (min/max per column) for an explicit sample range.
+ * Uses L channel only for display.
  */
 static void compute_waveform_range(instance_t *inst, int num_cols,
                                    int vis_start, int vis_end) {
@@ -574,7 +587,7 @@ static void compute_waveform_range(instance_t *inst, int num_cols,
         int16_t mx = -32768;
 
         for (int i = col_start; i < col_end; i++) {
-            int16_t s = inst->audio_data[i];
+            int16_t s = inst->audio_data[i * 2]; /* L channel */
             if (s < mn) mn = s;
             if (s > mx) mx = s;
         }
@@ -598,14 +611,16 @@ static void compute_waveform(instance_t *inst, int num_cols) {
  * ============================================================================ */
 
 /*
- * Scan audio buffer and compute peak level in dB.
+ * Scan stereo audio buffer and compute peak level in dB.
+ * Scans both L and R channels.
  * Returns -inf for silence.
  */
 static float compute_peak_db(const int16_t *data, int num_frames) {
     if (!data || num_frames <= 0) return -96.0f;
 
     int32_t peak = 0;
-    for (int i = 0; i < num_frames; i++) {
+    int total_samples = num_frames * SAMPLES_PER_FRAME;
+    for (int i = 0; i < total_samples; i++) {
         int32_t abs_val = (int32_t)data[i];
         if (abs_val < 0) abs_val = -abs_val;
         if (abs_val > peak) peak = abs_val;
@@ -632,8 +647,8 @@ static void save_undo(instance_t *inst) {
         inst->undo_buffer = NULL;
     }
 
-    inst->undo_buffer = (int16_t *)malloc(
-        (size_t)inst->audio_frames * sizeof(int16_t));
+    size_t buf_size = (size_t)inst->audio_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
+    inst->undo_buffer = (int16_t *)malloc(buf_size);
     if (!inst->undo_buffer) {
         inst->undo_frames = 0;
         inst->has_undo = 0;
@@ -641,8 +656,7 @@ static void save_undo(instance_t *inst) {
         return;
     }
 
-    memcpy(inst->undo_buffer, inst->audio_data,
-           (size_t)inst->audio_frames * sizeof(int16_t));
+    memcpy(inst->undo_buffer, inst->audio_data, buf_size);
     inst->undo_frames = inst->audio_frames;
     inst->has_undo = 1;
 }
@@ -915,19 +929,20 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     }
 
     /* --- Find zero crossing (S1000-style FIND) --- */
+    /* Uses L channel for zero crossing detection */
     if (strcmp(key, "find_zero_crossing") == 0) {
         if (!inst->audio_data || inst->audio_frames <= 2) return;
 
         int end_pos = inst->end_sample;
         int start_pos = inst->start_sample;
 
-        /* Reference: amplitude and slope at loop end point */
+        /* Reference: amplitude and slope at loop end point (L channel) */
         if (end_pos < 1) end_pos = 1;
         if (end_pos > inst->audio_frames) end_pos = inst->audio_frames;
         int ref_idx = end_pos - 1;
         if (ref_idx < 1) ref_idx = 1;
-        int ref_amp = (int)inst->audio_data[ref_idx];
-        int ref_slope = (int)inst->audio_data[ref_idx] - (int)inst->audio_data[ref_idx - 1];
+        int ref_amp = (int)inst->audio_data[ref_idx * 2];
+        int ref_slope = (int)inst->audio_data[ref_idx * 2] - (int)inst->audio_data[(ref_idx - 1) * 2];
 
         /* Search ±2048 samples around current start */
         int search_radius = 2048;
@@ -940,8 +955,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         int best_score = 0x7FFFFFFF;
 
         for (int i = search_lo; i <= search_hi; i++) {
-            int amp = (int)inst->audio_data[i];
-            int slope = (int)inst->audio_data[i] - (int)inst->audio_data[i - 1];
+            int amp = (int)inst->audio_data[i * 2];
+            int slope = (int)inst->audio_data[i * 2] - (int)inst->audio_data[(i - 1) * 2];
             int amp_err = abs(amp - ref_amp);
             int slope_err = abs(slope - ref_slope);
             int score = amp_err * 2 + slope_err;
@@ -996,15 +1011,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         save_undo(inst);
 
         /* Extract the selected region */
-        int16_t *new_data = (int16_t *)malloc(
-            (size_t)new_frames * sizeof(int16_t));
+        size_t buf_size = (size_t)new_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
+        int16_t *new_data = (int16_t *)malloc(buf_size);
         if (!new_data) {
             plugin_log("Trim: allocation failed");
             return;
         }
 
-        memcpy(new_data, inst->audio_data + start,
-               (size_t)new_frames * sizeof(int16_t));
+        memcpy(new_data, inst->audio_data + start * SAMPLES_PER_FRAME, buf_size);
 
         /* Replace audio */
         free(inst->audio_data);
@@ -1057,15 +1071,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->clipboard_frames = 0;
         }
 
-        inst->clipboard_data = (int16_t *)malloc(
-            (size_t)copy_frames * sizeof(int16_t));
+        size_t buf_size = (size_t)copy_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
+        inst->clipboard_data = (int16_t *)malloc(buf_size);
         if (!inst->clipboard_data) {
             plugin_log("Copy: clipboard allocation failed");
             return;
         }
 
-        memcpy(inst->clipboard_data, inst->audio_data + start,
-               (size_t)copy_frames * sizeof(int16_t));
+        memcpy(inst->clipboard_data, inst->audio_data + start * SAMPLES_PER_FRAME, buf_size);
         inst->clipboard_frames = copy_frames;
 
         {
@@ -1078,7 +1091,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     }
 
     if (strcmp(key, "export") == 0) {
-        /* Export selection to new file (old "copy" behavior) */
+        /* Export selection to new file */
         if (!inst->audio_data || inst->audio_frames <= 0) return;
 
         int start = inst->start_sample;
@@ -1098,7 +1111,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         make_edit_filename(inst->file_path, out_path, (int)sizeof(out_path));
 
         /* Write the selection to file */
-        if (write_wav(out_path, inst->audio_data + start, copy_frames,
+        if (write_wav(out_path, inst->audio_data + start * SAMPLES_PER_FRAME, copy_frames,
                       inst->sample_rate) == 0) {
             const char *out_name = basename_ptr(out_path);
             strncpy(inst->copy_result, out_name,
@@ -1127,8 +1140,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         save_undo(inst);
 
-        memset(inst->audio_data + start, 0,
-               (size_t)(end - start) * sizeof(int16_t));
+        memset(inst->audio_data + start * SAMPLES_PER_FRAME, 0,
+               (size_t)(end - start) * SAMPLES_PER_FRAME * sizeof(int16_t));
 
         inst->dirty = 1;
         compute_waveform(inst, 128);
@@ -1168,15 +1181,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->clipboard_frames = 0;
         }
 
-        inst->clipboard_data = (int16_t *)malloc(
-            (size_t)sel_frames * sizeof(int16_t));
+        size_t clip_size = (size_t)sel_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
+        inst->clipboard_data = (int16_t *)malloc(clip_size);
         if (!inst->clipboard_data) {
             plugin_log("Cut: clipboard allocation failed");
             return;
         }
 
-        memcpy(inst->clipboard_data, inst->audio_data + start,
-               (size_t)sel_frames * sizeof(int16_t));
+        memcpy(inst->clipboard_data, inst->audio_data + start * SAMPLES_PER_FRAME, clip_size);
         inst->clipboard_frames = sel_frames;
 
         /* Remove selection from audio_data */
@@ -1184,7 +1196,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (new_frames <= 0) {
             /* Cutting everything — leave a tiny silent buffer */
             new_frames = 1;
-            int16_t *new_data = (int16_t *)calloc(1, sizeof(int16_t));
+            int16_t *new_data = (int16_t *)calloc(SAMPLES_PER_FRAME, sizeof(int16_t));
             if (!new_data) {
                 plugin_log("Cut: allocation failed");
                 return;
@@ -1192,8 +1204,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             free(inst->audio_data);
             inst->audio_data = new_data;
         } else {
-            int16_t *new_data = (int16_t *)malloc(
-                (size_t)new_frames * sizeof(int16_t));
+            size_t new_size = (size_t)new_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
+            int16_t *new_data = (int16_t *)malloc(new_size);
             if (!new_data) {
                 plugin_log("Cut: allocation failed");
                 return;
@@ -1202,11 +1214,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             /* Copy [0..start] + [end..audio_frames] */
             if (start > 0) {
                 memcpy(new_data, inst->audio_data,
-                       (size_t)start * sizeof(int16_t));
+                       (size_t)start * SAMPLES_PER_FRAME * sizeof(int16_t));
             }
             if (end < inst->audio_frames) {
-                memcpy(new_data + start, inst->audio_data + end,
-                       (size_t)(inst->audio_frames - end) * sizeof(int16_t));
+                memcpy(new_data + start * SAMPLES_PER_FRAME,
+                       inst->audio_data + end * SAMPLES_PER_FRAME,
+                       (size_t)(inst->audio_frames - end) * SAMPLES_PER_FRAME * sizeof(int16_t));
             }
 
             free(inst->audio_data);
@@ -1259,8 +1272,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         save_undo(inst);
 
-        int16_t *new_data = (int16_t *)malloc(
-            (size_t)new_frames * sizeof(int16_t));
+        size_t new_size = (size_t)new_frames * SAMPLES_PER_FRAME * sizeof(int16_t);
+        int16_t *new_data = (int16_t *)malloc(new_size);
         if (!new_data) {
             plugin_log("Paste: allocation failed");
             return;
@@ -1269,14 +1282,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         /* Copy [0..insert_at] + clipboard + [insert_at..audio_frames] */
         if (insert_at > 0) {
             memcpy(new_data, inst->audio_data,
-                   (size_t)insert_at * sizeof(int16_t));
+                   (size_t)insert_at * SAMPLES_PER_FRAME * sizeof(int16_t));
         }
-        memcpy(new_data + insert_at, inst->clipboard_data,
-               (size_t)inst->clipboard_frames * sizeof(int16_t));
+        memcpy(new_data + insert_at * SAMPLES_PER_FRAME, inst->clipboard_data,
+               (size_t)inst->clipboard_frames * SAMPLES_PER_FRAME * sizeof(int16_t));
         if (insert_at < inst->audio_frames) {
-            memcpy(new_data + insert_at + inst->clipboard_frames,
-                   inst->audio_data + insert_at,
-                   (size_t)(inst->audio_frames - insert_at) * sizeof(int16_t));
+            memcpy(new_data + (insert_at + inst->clipboard_frames) * SAMPLES_PER_FRAME,
+                   inst->audio_data + insert_at * SAMPLES_PER_FRAME,
+                   (size_t)(inst->audio_frames - insert_at) * SAMPLES_PER_FRAME * sizeof(int16_t));
         }
 
         free(inst->audio_data);
@@ -1311,8 +1324,9 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         /* Convert dB to linear gain */
         float linear_gain = powf(10.0f, inst->gain_db / 20.0f);
+        int total_samples = inst->audio_frames * SAMPLES_PER_FRAME;
 
-        for (int i = 0; i < inst->audio_frames; i++) {
+        for (int i = 0; i < total_samples; i++) {
             float s = (float)inst->audio_data[i] * linear_gain;
             /* Clamp to int16 range */
             if (s > 32767.0f) s = 32767.0f;
@@ -1350,8 +1364,9 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         /* Calculate gain needed to reach target */
         float gain_needed_db = NORMALIZE_TARGET_DB - current_peak_db;
         float linear_gain = powf(10.0f, gain_needed_db / 20.0f);
+        int total_samples = inst->audio_frames * SAMPLES_PER_FRAME;
 
-        for (int i = 0; i < inst->audio_frames; i++) {
+        for (int i = 0; i < total_samples; i++) {
             float s = (float)inst->audio_data[i] * linear_gain;
             if (s > 32767.0f) s = 32767.0f;
             if (s < -32768.0f) s = -32768.0f;
@@ -1427,6 +1442,23 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(key, "save_as") == 0) {
+        /* Save full audio to a specified path (stereo 16-bit PCM) */
+        if (!inst->audio_data || inst->audio_frames <= 0 || !val || val[0] == '\0') {
+            plugin_log("save_as: no audio or no path");
+            return;
+        }
+        if (write_wav(val, inst->audio_data, inst->audio_frames,
+                      inst->sample_rate) == 0) {
+            char log_buf[256];
+            snprintf(log_buf, sizeof(log_buf), "Saved copy to: %s", val);
+            plugin_log(log_buf);
+        } else {
+            plugin_log("save_as failed");
+        }
+        return;
+    }
+
     if (strcmp(key, "dirty") == 0) {
         inst->dirty = (val && val[0] == '1') ? 1 : 0;
         return;
@@ -1469,9 +1501,6 @@ static int v2_get_param(void *instance, const char *key, char *buf,
     }
 
     /* --- Waveform data --- */
-    /* Accepts "waveform" or "waveform:start,end" where start,end is the
-     * visible sample range (computed by the UI's zoom logic). This avoids
-     * the fire-and-forget race where zoom SET gets overwritten by the GET. */
     if (strncmp(key, "waveform", 8) == 0) {
         int vis_start = -1, vis_end = -1;
         if (key[8] == ':') {
@@ -1528,9 +1557,6 @@ static int v2_get_param(void *instance, const char *key, char *buf,
     }
 
     /* --- Seam waveform (loop junction view) --- */
-    /* Format: "seam_waveform:start,end,half_samples"
-     * Returns 128 [min,max] pairs: first 64 cols approach loop end,
-     * last 64 cols continue from loop start (the seam junction). */
     if (strncmp(key, "seam_waveform:", 14) == 0) {
         int sw_start = 0, sw_end = 0, half_samples = 0;
         if (sscanf(key + 14, "%d,%d,%d", &sw_start, &sw_end, &half_samples) != 3
@@ -1773,20 +1799,24 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
             }
         }
 
-        int16_t sample = inst->audio_data[inst->play_pos];
+        int16_t sample_l = inst->audio_data[inst->play_pos * 2];
+        int16_t sample_r = inst->audio_data[inst->play_pos * 2 + 1];
         inst->play_pos++;
 
-        /* Apply gain preview in gain mode */
+        /* Apply gain preview */
         if (linear_gain != 1.0f) {
-            float s = (float)sample * linear_gain;
-            if (s > 32767.0f) s = 32767.0f;
-            if (s < -32768.0f) s = -32768.0f;
-            sample = (int16_t)s;
+            float sl = (float)sample_l * linear_gain;
+            float sr = (float)sample_r * linear_gain;
+            if (sl > 32767.0f) sl = 32767.0f;
+            if (sl < -32768.0f) sl = -32768.0f;
+            if (sr > 32767.0f) sr = 32767.0f;
+            if (sr < -32768.0f) sr = -32768.0f;
+            sample_l = (int16_t)sl;
+            sample_r = (int16_t)sr;
         }
 
-        /* Mono to stereo: same sample on both channels */
-        out_interleaved_lr[i * 2]     = sample;
-        out_interleaved_lr[i * 2 + 1] = sample;
+        out_interleaved_lr[i * 2]     = sample_l;
+        out_interleaved_lr[i * 2 + 1] = sample_r;
     }
 }
 
@@ -1794,20 +1824,21 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
  * V2 API registration
  * ============================================================================ */
 
-static plugin_api_v2_t g_api;
+static plugin_api_v2_t s_plugin_api = {
+    .api_version = MOVE_PLUGIN_API_VERSION_2,
+    .create_instance = v2_create,
+    .destroy_instance = v2_destroy,
+    .on_midi = v2_on_midi,
+    .set_param = v2_set_param,
+    .get_param = v2_get_param,
+    .get_error = v2_get_error,
+    .render_block = v2_render_block,
+};
 
-plugin_api_v2_t* move_plugin_init_v2(const host_api_v1_t *host) {
-    g_host = host;
-    memset(&g_api, 0, sizeof(g_api));
-    g_api.api_version      = MOVE_PLUGIN_API_VERSION_2;
-    g_api.create_instance  = v2_create;
-    g_api.destroy_instance = v2_destroy;
-    g_api.on_midi          = v2_on_midi;
-    g_api.set_param        = v2_set_param;
-    g_api.get_param        = v2_get_param;
-    g_api.get_error        = v2_get_error;
-    g_api.render_block     = v2_render_block;
-
-    plugin_log("Plugin v2 initialized");
-    return &g_api;
+__attribute__((visibility("default")))
+void *move_plugin_init_v2(const host_api_v1_t *host_api) {
+    if (!host_api) return NULL;
+    g_host = host_api;
+    plugin_log("Plugin initialized (V2 stereo)");
+    return &s_plugin_api;
 }

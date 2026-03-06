@@ -21,7 +21,7 @@ mkdir -p "dist/$MODULE_ID"
 echo "Packaging..."
 cp src/module.json "dist/$MODULE_ID/"
 cp src/ui.js "dist/$MODULE_ID/"
-cp src/dsp.so "dist/$MODULE_ID/"
+cp src/dsp/dsp.so "dist/$MODULE_ID/"
 [ -f src/help.json ] && cp src/help.json "dist/$MODULE_ID/"
 chmod +x "dist/$MODULE_ID/dsp.so"
 
