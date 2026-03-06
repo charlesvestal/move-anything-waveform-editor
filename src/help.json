@@ -64,8 +64,8 @@
         "  audition selection",
         "  release to stop",
         "",
-        "Shift+Pad: play",
-        "  entire file",
+        "Shift+Pad: preview",
+        "  near end marker",
         "",
         "Shift+Loop: toggle",
         "  loop mode on/off",
@@ -145,6 +145,27 @@
         "",
         "Jog on Count toggles",
         "  Chop / Play sub-mode."
+      ]
+    },
+    {
+      "title": "Recording",
+      "lines": [
+        "Open File browser:",
+        "  select New Recording",
+        "  to create a new file",
+        "",
+        "Records Move's audio",
+        "  output (resample).",
+        "",
+        "REC LED flashes when",
+        "  armed. Press REC to",
+        "  start recording.",
+        "Press REC again to",
+        "  stop. File loads",
+        "  into editor.",
+        "",
+        "Back: cancel and",
+        "  return to browser"
       ]
     },
     {

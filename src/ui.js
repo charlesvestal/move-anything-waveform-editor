@@ -98,6 +98,7 @@ var CC_RIGHT = MoveRight;
 var CC_DOWN = MoveDown;
 var CC_UP = MoveUp;
 var CC_SAMPLE = MoveSample;
+var CC_REC = MoveRec;
 
 /* Pad note range */
 var PAD_NOTE_MIN = MovePads[0];
@@ -200,6 +201,14 @@ var sliceMenuIndex = 0;
 var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
+/* Record state */
+var recordState = "idle";        /* "idle" | "ready" | "recording" */
+var recordFilePath = "";         /* auto-generated path */
+var recordStartTime = 0;         /* Date.now() when recording started */
+var recordBrowserDir = "";       /* directory user was browsing */
+var recordLedCounter = 0;        /* tick counter for LED flash */
+var recordWaveform = null;       /* Array of 128 peak values (0.0-1.0) for live display */
+
 /* REX encoder detection */
 var REX_MODULE_PATH = "/data/UserData/move-anything/modules/sound_generators/rex";
 var REX_ENCODE_BIN = REX_MODULE_PATH + "/rex-encode";
@@ -235,6 +244,43 @@ var saveItemsNormal = ["Overwrite", "Cancel"];
 var saveItems = saveItemsNormal;
 var saveIndex = 0;
 var saveReturnView = VIEW_TRIM; /* View to return to after save/cancel */
+
+/**
+ * Generate a timestamped recording filename.
+ */
+/**
+ * Refresh the file browser and prepend "New Recording" action item.
+ */
+function refreshBrowserWithRecording() {
+    refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+    if (openFileBrowserState && openFileBrowserState.items) {
+        /* Insert after ".." (up) entry if present, otherwise at top */
+        var insertIdx = 0;
+        if (openFileBrowserState.items.length > 0 && openFileBrowserState.items[0].kind === "up") {
+            insertIdx = 1;
+        }
+        openFileBrowserState.items.splice(insertIdx, 0, {
+            kind: "action",
+            label: "+ New Recording",
+            path: ""
+        });
+        /* Adjust selectedIndex if it was at or after the insert point */
+        if (openFileBrowserState.selectedIndex >= insertIdx) {
+            openFileBrowserState.selectedIndex++;
+        }
+    }
+}
+
+/**
+ * Generate a timestamped recording filename.
+ */
+function generateRecordingPath(dir) {
+    var d = new Date();
+    var pad2 = function(n) { return n < 10 ? "0" + n : "" + n; };
+    var stamp = d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate())
+        + "_" + pad2(d.getHours()) + "-" + pad2(d.getMinutes()) + "-" + pad2(d.getSeconds());
+    return dir + "/Recording_" + stamp + ".wav";
+}
 
 function isRexAvailable() {
     return (typeof host_file_exists === "function") &&
@@ -1060,6 +1106,59 @@ function drawWaveform() {
 function drawTrimView() {
     clear_screen();
 
+    /* Record-ready state: empty waveform, waiting for REC press */
+    if (recordState === "ready") {
+        print(0, 0, "NEW RECORDING", 1);
+        drawDivider(10);
+        /* Empty waveform area with centered prompt */
+        draw_line(0, WAVE_MID, SCREEN_W - 1, WAVE_MID, 1);
+        printCentered(WAVE_MID - 10, "Press REC");
+        printCentered(WAVE_MID + 4, "to record");
+        drawDivider(WAVE_Y_BOT + 1);
+        printCentered(54, "Back: cancel");
+        return;
+    }
+
+    /* Recording state: scrolling waveform + elapsed timer */
+    if (recordState === "recording") {
+        /* Sample VU peak and push into waveform buffer */
+        if (recordWaveform) {
+            var peak = 0;
+            if (typeof shadow_get_overlay_state === "function") {
+                var ov = shadow_get_overlay_state();
+                if (ov && typeof ov.samplerVuPeak === "number") {
+                    peak = ov.samplerVuPeak / 32767.0;
+                }
+            }
+            recordWaveform.shift();
+            recordWaveform.push(peak);
+        }
+
+        /* Header: REC + elapsed time */
+        var elapsed = (Date.now() - recordStartTime) / 1000;
+        var mins = Math.floor(elapsed / 60);
+        var secs = elapsed % 60;
+        var timeStr = mins + ":" + (secs < 10 ? "0" : "") + secs.toFixed(1);
+        print(0, 0, "REC  " + timeStr, 1);
+        drawDivider(10);
+
+        /* Draw live waveform */
+        if (recordWaveform) {
+            var halfH = WAVE_HEIGHT / 2;
+            for (var x = 0; x < SCREEN_W; x++) {
+                var amp = recordWaveform[x];
+                if (amp <= 0) continue;
+                var h = Math.round(amp * halfH);
+                if (h < 1) h = 1;
+                draw_line(x, WAVE_MID - h, x, WAVE_MID + h, 1);
+            }
+        }
+
+        drawDivider(WAVE_Y_BOT + 1);
+        printCentered(54, "REC: stop");
+        return;
+    }
+
     /* Header: MODE*L  filename.wav  1.2s */
     var modeStr = buildModeHeader("TRIM");
     print(0, 0, modeStr, 1);
@@ -1498,6 +1597,19 @@ function switchView(view) {
         if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
         recomputeSliceBoundaries();
         selectSlice(0);
+        /* Zoom to fit the slice region with 10% margin on each side */
+        var regionLen = sliceRegionEnd - sliceRegionStart;
+        if (regionLen > 0 && regionLen < totalFrames) {
+            /* Target visible range = regionLen / 0.80 (10% margin each side) */
+            var targetRange = regionLen / 0.80;
+            var newZoom = Math.log2(totalFrames / targetRange);
+            if (newZoom < 0) newZoom = 0;
+            if (newZoom > ZOOM_MAX) newZoom = ZOOM_MAX;
+            zoomLevel = newZoom;
+            zoomCenter = sliceRegionStart + Math.floor(regionLen / 2);
+            if (zoomCenter < 0) zoomCenter = 0;
+            if (zoomCenter > totalFrames) zoomCenter = totalFrames;
+        }
         syncMarkersToDs();
         refreshState();
         refreshWaveform();
@@ -1544,7 +1656,7 @@ function enterOpenFileBrowser() {
         { root: "/data/UserData/UserLibrary/Samples", filter: ".wav", name: "Open File" },
         currentFile
     );
-    refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+    refreshBrowserWithRecording();
     currentView = VIEW_OPEN_FILE;
     var dir = openFileBrowserState.currentDir || "";
     var dirName = dir.substring(dir.lastIndexOf("/") + 1) || "Samples";
@@ -1700,7 +1812,7 @@ function doSave() {
  */
 function attemptExit() {
     refreshState();
-    if (dirty) {
+    if (dirty || gainDb !== 0.0) {
         confirmIndex = 0;
         switchView(VIEW_CONFIRM_EXIT);
     } else {
@@ -1724,6 +1836,14 @@ function exitEditor() {
  */
 function startPlayback() {
     pendingPlay = "selection";
+    playing = true;
+}
+
+/**
+ * Queue playback from an arbitrary frame position (plays to end_sample).
+ */
+function startPlaybackFrom(frame) {
+    pendingPlay = "from:" + frame;
     playing = true;
 }
 
@@ -2239,11 +2359,33 @@ function handleCC(cc, value) {
         return;
     }
 
+    /* During record states, only allow Back and Rec buttons */
+    if (recordState !== "idle" && cc !== CC_BACK && cc !== CC_REC) {
+        return;
+    }
+
     /* Only handle presses (value > 0) for remaining CCs, except jog/encoders */
     var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4);
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
+        /* Handle record states first */
+        if (recordState === "recording") {
+            /* Stop and discard */
+            host_sampler_stop();
+            recordState = "idle";
+            setButtonLED(CC_REC, LED_OFF);
+            announce("Recording cancelled");
+            enterOpenFileBrowser();
+            return;
+        }
+        if (recordState === "ready") {
+            recordState = "idle";
+            setButtonLED(CC_REC, LED_OFF);
+            announce("Cancelled");
+            enterOpenFileBrowser();
+            return;
+        }
         switch (currentView) {
             case VIEW_TRIM:
             case VIEW_LOOP:
@@ -2298,7 +2440,7 @@ function handleCC(cc, value) {
                     }
                     openFileBrowserState.selectedIndex = 0;
                     openFileBrowserState.selectedPath = "";
-                    refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+                    refreshBrowserWithRecording();
                     var bDir = openFileBrowserState.currentDir || "";
                     var bDirName = bDir.substring(bDir.lastIndexOf("/") + 1) || "Samples";
                     var bFirst = (openFileBrowserState.items && openFileBrowserState.items.length > 0)
@@ -2377,6 +2519,38 @@ function handleCC(cc, value) {
                 /* Loop button in trim view: enter loop view */
                 switchView(VIEW_LOOP);
             }
+        }
+        return;
+    }
+
+    /* REC button — start/stop recording */
+    if (cc === CC_REC && value > 0) {
+        if (recordState === "ready") {
+            /* Ensure parent directory exists */
+            if (typeof host_ensure_dir === "function") {
+                host_ensure_dir(recordBrowserDir);
+            }
+            host_sampler_start(recordFilePath);
+            recordStartTime = Date.now();
+            recordState = "recording";
+            recordWaveform = new Array(SCREEN_W).fill(0);
+            setButtonLED(CC_REC, BrightRed);
+            announce("Recording");
+        } else if (recordState === "recording") {
+            host_sampler_stop();
+            recordState = "idle";
+            recordWaveform = null;
+            setButtonLED(CC_REC, LED_OFF);
+            /* Load the recorded file — reset path first to force DSP re-init */
+            openedFilePath = recordFilePath;
+            host_module_set_param("file_path", "");
+            host_module_set_param("file_path", recordFilePath);
+            refreshFileInfo();
+            waveformDirty = true;
+            refreshWaveform();
+            refreshState();
+            announce("Loaded " + fileName);
+            showStatus("Recorded " + fileName, 90);
         }
         return;
     }
@@ -2696,9 +2870,21 @@ function handleCC(cc, value) {
 
             case VIEW_OPEN_FILE:
                 if (openFileBrowserState) {
+                    /* Check for "New Recording" action item */
+                    var selItem = openFileBrowserState.items[openFileBrowserState.selectedIndex];
+                    if (selItem && selItem.kind === "action") {
+                        recordBrowserDir = openFileBrowserState.currentDir;
+                        recordFilePath = generateRecordingPath(recordBrowserDir);
+                        recordState = "ready";
+                        recordLedCounter = 0;
+                        openFileBrowserState = null;
+                        switchView(VIEW_TRIM);
+                        announce("New Recording, press REC to record");
+                        break;
+                    }
                     var result = activateFilepathBrowserItem(openFileBrowserState);
                     if (result.action === "open") {
-                        refreshFilepathBrowser(openFileBrowserState, OPEN_FILE_FS);
+                        refreshBrowserWithRecording();
                         var oDir = openFileBrowserState.currentDir || "";
                         var oDirName = oDir.substring(oDir.lastIndexOf("/") + 1) || "Samples";
                         var oFirst = (openFileBrowserState.items && openFileBrowserState.items.length > 0)
@@ -2749,6 +2935,20 @@ function handleCC(cc, value) {
             if (newVal > maxVal) newVal = maxVal;
             sliceBoundaries[bIdx] = newVal;
             selectSlice(selectedSlice);
+            /* Auto-scroll to keep start marker visible with 10% margin */
+            if (zoomLevel > 0) {
+                var vStart = getVisibleStart();
+                var vEnd = getVisibleEnd();
+                var vRange = vEnd - vStart;
+                var margin = Math.floor(vRange * 0.10);
+                if (newVal < vStart + margin) {
+                    zoomCenter = newVal + Math.floor(vRange / 2) - margin;
+                } else if (newVal > vEnd - margin) {
+                    zoomCenter = newVal - Math.floor(vRange / 2) + margin;
+                }
+                if (zoomCenter < 0) zoomCenter = 0;
+                if (zoomCenter > totalFrames) zoomCenter = totalFrames;
+            }
             syncMarkersToDs();
             showKnobStatus(0, "Start:" + formatTime(sliceBoundaries[bIdx]));
         }
@@ -2783,6 +2983,20 @@ function handleCC(cc, value) {
             if (newVal > maxVal) newVal = maxVal;
             sliceBoundaries[bIdx] = newVal;
             selectSlice(selectedSlice);
+            /* Auto-scroll to keep end marker visible with 10% margin */
+            if (zoomLevel > 0) {
+                var vStart = getVisibleStart();
+                var vEnd = getVisibleEnd();
+                var vRange = vEnd - vStart;
+                var margin = Math.floor(vRange * 0.10);
+                if (newVal > vEnd - margin) {
+                    zoomCenter = newVal - Math.floor(vRange / 2) + margin;
+                } else if (newVal < vStart + margin) {
+                    zoomCenter = newVal + Math.floor(vRange / 2) - margin;
+                }
+                if (zoomCenter < 0) zoomCenter = 0;
+                if (zoomCenter > totalFrames) zoomCenter = totalFrames;
+            }
             syncMarkersToDs();
             showKnobStatus(1, "End:" + formatTime(sliceBoundaries[bIdx]));
         }
@@ -2890,6 +3104,9 @@ function handleCC(cc, value) {
  * Handle note messages (pads and encoder touch events).
  */
 function handleNote(note, velocity) {
+    /* Ignore pads during record states */
+    if (recordState !== "idle") return;
+
     /* Pad press/release: audition (hold to play, release to stop).
      * Only the most recently pressed pad owns playback — releasing
      * an earlier pad while a newer one is held does nothing. */
@@ -2898,8 +3115,18 @@ function handleNote(note, velocity) {
             if (velocity > 0) {
                 setLED(note, PAD_COLOR_PLAY);
                 activePadNote = note;
-                startPlayback();
-                showStatus("Play Sel", 20);
+                if (shiftHeld) {
+                    /* Shift+pad: preview from 10% before end marker */
+                    var selLen = endSample - startSample;
+                    var previewLen = Math.max(Math.floor(selLen * 0.1), 1000);
+                    var from = endSample - previewLen;
+                    if (from < startSample) from = startSample;
+                    startPlaybackFrom(from);
+                    showStatus("Preview End", 20);
+                } else {
+                    startPlayback();
+                    showStatus("Play Sel", 20);
+                }
             } else {
                 setLED(note, PAD_COLOR_DIM);
                 if (note === activePadNote) {
@@ -2996,7 +3223,18 @@ globalThis.init = function() {
     currentView = VIEW_TRIM;
     selectedField = 0;
     host_module_set_param("mode", "0");
-    announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+
+    /* If the file didn't load (new file path), enter record-ready state */
+    if (openedFilePath && totalFrames === 0) {
+        var lastSlash = openedFilePath.lastIndexOf("/");
+        recordBrowserDir = lastSlash > 0 ? openedFilePath.substring(0, lastSlash) : "";
+        recordFilePath = openedFilePath;
+        recordState = "ready";
+        recordLedCounter = 0;
+        announce("New Recording, press REC to record");
+    } else {
+        announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+    }
 };
 
 globalThis.tick = function() {
@@ -3017,6 +3255,8 @@ globalThis.tick = function() {
     if (pendingPlay !== "") {
         if (pendingPlay === "stop") {
             host_module_set_param("stop", "1");
+        } else if (pendingPlay.indexOf("from:") === 0) {
+            host_module_set_param("play_from", pendingPlay.substring(5));
         } else {
             if (currentView === VIEW_SLICE) {
                 syncMarkersToDs();
@@ -3067,6 +3307,14 @@ globalThis.tick = function() {
                     break;
                 }
             }
+        }
+    }
+
+    /* Record LED flash */
+    if (recordState === "ready") {
+        recordLedCounter++;
+        if (recordLedCounter % 15 === 0) {
+            setButtonLED(CC_REC, (recordLedCounter % 30 < 15) ? BrightRed : LED_OFF);
         }
     }
 
