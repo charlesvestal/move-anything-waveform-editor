@@ -43,7 +43,8 @@ import {
     MoveCapture, MoveRec, MoveSample, MoveUndo, MoveLoop, MoveCopy, MoveMute, MoveDelete,
     MoveLeft, MoveRight, MoveDown, MoveUp,
     MovePads,
-    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4,
+    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob7, MoveKnob8,
+    MoveKnob5Touch, MoveKnob7Touch, MoveKnob8Touch,
     White, Black, DarkGrey, LightGrey, BrightRed,
     WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright
 } from '/data/UserData/move-anything/shared/constants.mjs';
@@ -85,6 +86,9 @@ var CC_E1 = MoveKnob1;
 var CC_E2 = MoveKnob2;
 var CC_E3 = MoveKnob3;
 var CC_E4 = MoveKnob4;
+var CC_E5 = MoveKnob5;
+var CC_E7 = MoveKnob7;
+var CC_E8 = MoveKnob8;
 var CC_SHIFT = MoveShift;
 var CC_BACK = MoveBack;
 var CC_MUTE = MoveMute;
@@ -130,6 +134,9 @@ var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
 
 var currentView = VIEW_TRIM;
 var shiftHeld = false;
+
+/* Twist-action knob state (touch + twist right = execute, twist left = cancel) */
+var pendingTwistAction = null; /* { cc, action, prompt } or null */
 
 /* File info */
 var fileName = "";
@@ -202,12 +209,15 @@ var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
 /* Record state */
-var recordState = "idle";        /* "idle" | "ready" | "recording" */
+var recordState = "idle";        /* "idle" | "ready" | "recording" | "stopping" */
+var recordStoppingTicks = 0;     /* tick counter while waiting for sampler to finalize */
 var recordFilePath = "";         /* auto-generated path */
 var recordStartTime = 0;         /* Date.now() when recording started */
 var recordBrowserDir = "";       /* directory user was browsing */
 var recordLedCounter = 0;        /* tick counter for LED flash */
-var recordWaveform = null;       /* Array of 128 peak values (0.0-1.0) for live display */
+var recordWaveform = null;       /* Array of peak values (0.0-1.0) for live display */
+var recordWriteHead = 0;         /* Current write position in recordWaveform */
+var RECORD_SCROLL_X = Math.floor(SCREEN_W * 0.90); /* Write head sticks here once reached */
 
 /* REX encoder detection */
 var REX_MODULE_PATH = "/data/UserData/move-anything/modules/sound_generators/rex";
@@ -1119,40 +1129,71 @@ function drawTrimView() {
         return;
     }
 
+    /* Stopping state: waiting for WAV to finalize */
+    if (recordState === "stopping") {
+        print(0, 0, "SAVING...", 1);
+        drawDivider(10);
+        draw_line(0, WAVE_MID, SCREEN_W - 1, WAVE_MID, 1);
+        printCentered(WAVE_MID - 4, "Finalizing recording");
+        drawDivider(WAVE_Y_BOT + 1);
+        return;
+    }
+
     /* Recording state: scrolling waveform + elapsed timer */
     if (recordState === "recording") {
-        /* Sample VU peak and push into waveform buffer */
-        if (recordWaveform) {
-            var peak = 0;
-            if (typeof shadow_get_overlay_state === "function") {
-                var ov = shadow_get_overlay_state();
-                if (ov && typeof ov.samplerVuPeak === "number") {
-                    peak = ov.samplerVuPeak / 32767.0;
-                }
+        /* Sample VU peak and append to waveform buffer */
+        var peak = 0;
+        if (typeof shadow_get_overlay_state === "function") {
+            var ov = shadow_get_overlay_state();
+            if (ov && typeof ov.samplerVuPeak === "number") {
+                peak = ov.samplerVuPeak / 32767.0;
             }
-            recordWaveform.shift();
-            recordWaveform.push(peak);
         }
+        recordWaveform.push(peak);
+        recordWriteHead++;
 
-        /* Header: REC + elapsed time */
+        /* Header: REC + elapsed time + debug peak value */
         var elapsed = (Date.now() - recordStartTime) / 1000;
         var mins = Math.floor(elapsed / 60);
         var secs = elapsed % 60;
         var timeStr = mins + ":" + (secs < 10 ? "0" : "") + secs.toFixed(1);
-        print(0, 0, "REC  " + timeStr, 1);
+        var rawVu = 0;
+        if (typeof shadow_get_overlay_state === "function") {
+            var dbgOv = shadow_get_overlay_state();
+            if (dbgOv) rawVu = dbgOv.samplerVuPeak || 0;
+        }
+        print(0, 0, "REC " + timeStr + " vu:" + rawVu, 1);
         drawDivider(10);
 
-        /* Draw live waveform */
-        if (recordWaveform) {
-            var halfH = WAVE_HEIGHT / 2;
-            for (var x = 0; x < SCREEN_W; x++) {
-                var amp = recordWaveform[x];
-                if (amp <= 0) continue;
-                var h = Math.round(amp * halfH);
-                if (h < 1) h = 1;
-                draw_line(x, WAVE_MID - h, x, WAVE_MID + h, 1);
-            }
+        /* Draw live waveform with write head.
+         * Phase 1: head < RECORD_SCROLL_X — draw from x=0, head advances right.
+         * Phase 2: head >= RECORD_SCROLL_X — head stays at RECORD_SCROLL_X,
+         *          older data scrolls left behind it. */
+        var halfH = WAVE_HEIGHT / 2;
+        var dataLen = recordWaveform.length;
+        var headX; /* screen x of write head */
+        var dataOffset; /* index into recordWaveform for x=0 */
+
+        if (dataLen <= RECORD_SCROLL_X) {
+            /* Phase 1: filling in from left */
+            headX = dataLen - 1;
+            dataOffset = 0;
+        } else {
+            /* Phase 2: scrolling — head pinned at RECORD_SCROLL_X */
+            headX = RECORD_SCROLL_X;
+            dataOffset = dataLen - RECORD_SCROLL_X - 1;
         }
+
+        for (var x = 0; x <= headX; x++) {
+            var amp = recordWaveform[dataOffset + x];
+            if (amp <= 0) continue;
+            var h = Math.round(amp * halfH);
+            if (h < 1) h = 1;
+            draw_line(x, WAVE_MID - h, x, WAVE_MID + h, 1);
+        }
+
+        /* Draw write head cursor */
+        draw_line(headX, WAVE_Y_TOP, headX, WAVE_Y_BOT, 1);
 
         drawDivider(WAVE_Y_BOT + 1);
         printCentered(54, "REC: stop");
@@ -1865,6 +1906,15 @@ function toggleLoop() {
     updateLeds();
 }
 
+function snapToZeroCrossing() {
+    host_module_set_param("find_zero_crossing", "1");
+    var newStart = host_module_get_param("start_sample");
+    if (newStart) startSample = parseInt(newStart, 10) || 0;
+    syncMarkersToDs();
+    if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+    showStatus("Zero-X found", 60);
+}
+
 /**
  * Execute trim operation (discard audio outside markers).
  */
@@ -2360,12 +2410,12 @@ function handleCC(cc, value) {
     }
 
     /* During record states, only allow Back and Rec buttons */
-    if (recordState !== "idle" && cc !== CC_BACK && cc !== CC_REC) {
+    if (recordState !== "idle" && recordState !== "stopping" && cc !== CC_BACK && cc !== CC_REC) {
         return;
     }
 
     /* Only handle presses (value > 0) for remaining CCs, except jog/encoders */
-    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4);
+    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4 || cc === CC_E5 || cc === CC_E7 || cc === CC_E8);
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
@@ -2533,24 +2583,17 @@ function handleCC(cc, value) {
             host_sampler_start(recordFilePath);
             recordStartTime = Date.now();
             recordState = "recording";
-            recordWaveform = new Array(SCREEN_W).fill(0);
+            recordWaveform = [];
+            recordWriteHead = 0;
             setButtonLED(CC_REC, BrightRed);
             announce("Recording");
         } else if (recordState === "recording") {
             host_sampler_stop();
-            recordState = "idle";
+            recordState = "stopping";
+            recordStoppingTicks = 0;
             recordWaveform = null;
             setButtonLED(CC_REC, LED_OFF);
-            /* Load the recorded file — reset path first to force DSP re-init */
-            openedFilePath = recordFilePath;
-            host_module_set_param("file_path", "");
-            host_module_set_param("file_path", recordFilePath);
-            refreshFileInfo();
-            waveformDirty = true;
-            refreshWaveform();
-            refreshState();
-            announce("Loaded " + fileName);
-            showStatus("Recorded " + fileName, 90);
+            showStatus("Saving...", 90);
         }
         return;
     }
@@ -3033,85 +3076,54 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* E3 turn: zoom (normal) or vertical scale (shift) */
+    /* E3 turn: zoom */
     if (cc === CC_E3) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM) {
-            if (shiftHeld) {
-                /* Shift+E3: vertical waveform scale */
-                vScale *= Math.pow(2, delta * VSCALE_STEP);
-                if (vScale < VSCALE_MIN) vScale = VSCALE_MIN;
-                if (vScale > VSCALE_MAX) vScale = VSCALE_MAX;
-                if (vScale > 0.9 && vScale < 1.1) vScale = 1.0;
-                showKnobStatus(2, "Scale:" + vScale.toFixed(1) + "x");
-            } else {
-                /* E3: horizontal zoom */
-                var wasZero = (zoomLevel <= 0);
-                zoomLevel += delta * ZOOM_STEP;
-                if (zoomLevel < 0) zoomLevel = 0;
-                if (zoomLevel > ZOOM_MAX) zoomLevel = ZOOM_MAX;
-
-                if (wasZero && zoomLevel > 0) {
-                    zoomCenter = selectedField === 0 ? startSample : endSample;
-                }
-                if (zoomLevel <= 0) {
-                    showKnobStatus(2, "Zoom: Full");
-                } else {
-                    var zoomFactor = Math.pow(2, zoomLevel);
-                    showKnobStatus(2, "Zoom:" + zoomFactor.toFixed(1) + "x");
-                }
-                syncZoomToDsp();
+        if (currentView === VIEW_TRIM || currentView === VIEW_SLICE) {
+            var wasZero = (zoomLevel <= 0);
+            zoomLevel += delta * ZOOM_STEP;
+            if (zoomLevel < 0) zoomLevel = 0;
+            if (zoomLevel > ZOOM_MAX) zoomLevel = ZOOM_MAX;
+            if (wasZero && zoomLevel > 0) {
+                zoomCenter = (currentView === VIEW_SLICE) ? startSample
+                    : (selectedField === 0 ? startSample : endSample);
             }
+            if (zoomLevel <= 0) {
+                showKnobStatus(2, "Zoom: Full");
+            } else {
+                var zoomFactor = Math.pow(2, zoomLevel);
+                showKnobStatus(2, "Zoom:" + zoomFactor.toFixed(1) + "x");
+            }
+            syncZoomToDsp();
         } else if (currentView === VIEW_LOOP) {
-            if (shiftHeld) {
-                /* Shift+E3: vertical waveform scale */
-                vScale *= Math.pow(2, delta * VSCALE_STEP);
-                if (vScale < VSCALE_MIN) vScale = VSCALE_MIN;
-                if (vScale > VSCALE_MAX) vScale = VSCALE_MAX;
-                if (vScale > 0.9 && vScale < 1.1) vScale = 1.0;
-                showKnobStatus(2, "Scale:" + vScale.toFixed(1) + "x");
-            } else {
-                /* E3: seam zoom (negate: CW = zoom in = fewer samples) */
-                seamZoomLevel -= delta * SEAM_ZOOM_STEP;
-                if (seamZoomLevel < 0) seamZoomLevel = 0;
-                if (seamZoomLevel > ZOOM_MAX) seamZoomLevel = ZOOM_MAX;
-                seamWaveformDirty = true;
-                var seamFactor = Math.pow(2, seamZoomLevel);
-                showKnobStatus(2, "Zoom:" + seamFactor.toFixed(1) + "x");
-            }
-        } else if (currentView === VIEW_SLICE) {
-            if (shiftHeld) {
-                vScale *= Math.pow(2, delta * VSCALE_STEP);
-                if (vScale < VSCALE_MIN) vScale = VSCALE_MIN;
-                if (vScale > VSCALE_MAX) vScale = VSCALE_MAX;
-                if (vScale > 0.9 && vScale < 1.1) vScale = 1.0;
-                showKnobStatus(2, "Scale:" + vScale.toFixed(1) + "x");
-            } else {
-                var wasZero = (zoomLevel <= 0);
-                zoomLevel += delta * ZOOM_STEP;
-                if (zoomLevel < 0) zoomLevel = 0;
-                if (zoomLevel > ZOOM_MAX) zoomLevel = ZOOM_MAX;
-                if (wasZero && zoomLevel > 0) {
-                    zoomCenter = startSample;
-                }
-                if (zoomLevel <= 0) {
-                    showKnobStatus(2, "Zoom: Full");
-                } else {
-                    var zoomFactor = Math.pow(2, zoomLevel);
-                    showKnobStatus(2, "Zoom:" + zoomFactor.toFixed(1) + "x");
-                }
-                syncZoomToDsp();
-            }
+            /* E3: seam zoom (negate: CW = zoom in = fewer samples) */
+            seamZoomLevel -= delta * SEAM_ZOOM_STEP;
+            if (seamZoomLevel < 0) seamZoomLevel = 0;
+            if (seamZoomLevel > ZOOM_MAX) seamZoomLevel = ZOOM_MAX;
+            seamWaveformDirty = true;
+            var seamFactor = Math.pow(2, seamZoomLevel);
+            showKnobStatus(2, "Zoom:" + seamFactor.toFixed(1) + "x");
         }
         return;
     }
 
-    /* E4 turn: adjust gain | Shift+E4 press: normalize confirm */
+    /* E4 turn: vertical scale (all modes) */
     if (cc === CC_E4) {
+        var delta = decodeDelta(value);
+        if (delta === 0) return;
+        vScale *= Math.pow(2, delta * VSCALE_STEP);
+        if (vScale < VSCALE_MIN) vScale = VSCALE_MIN;
+        if (vScale > VSCALE_MAX) vScale = VSCALE_MAX;
+        if (vScale > 0.9 && vScale < 1.1) vScale = 1.0;
+        showKnobStatus(3, "Scale:" + vScale.toFixed(1) + "x");
+        return;
+    }
+
+    /* E5 turn: gain (trim/loop) | threshold (slice auto) | Shift+E5: normalize */
+    if (cc === CC_E5) {
         if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_AUTO) {
-            /* E4 in auto slice: adjust threshold (coarse=1.0, shift=0.1) */
             var delta = decodeDelta(value);
             if (delta === 0) return;
             var step = shiftHeld ? 0.1 : 1.0;
@@ -3123,12 +3135,12 @@ function handleCC(cc, value) {
             selectSlice(selectedSlice);
             syncMarkersToDs();
             updateSlicePadLeds();
-            showKnobStatus(3, "T:" + sliceThreshold.toFixed(1));
+            showKnobStatus(4, "T:" + sliceThreshold.toFixed(1));
             return;
         }
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
             if (shiftHeld) {
-                /* Shift+E4: show normalize confirm overlay */
+                /* Shift+E5: show normalize confirm overlay */
                 normalizeIndex = 0;
                 switchView(VIEW_CONFIRM_NORMALIZE);
             } else {
@@ -3138,9 +3150,28 @@ function handleCC(cc, value) {
                 if (gainDb < GAIN_MIN) gainDb = GAIN_MIN;
                 if (gainDb > GAIN_MAX) gainDb = GAIN_MAX;
                 host_module_set_param("gain_db", gainDb.toFixed(1));
-                showKnobStatus(3, "Gain:" + formatDb(gainDb));
+                showKnobStatus(4, "Gain:" + formatDb(gainDb));
                 invalidateWaveform();
             }
+        }
+        return;
+    }
+
+    /* E7/E8 twist actions: turn confirms/cancels pending action */
+    if (cc === CC_E7 || cc === CC_E8) {
+        var delta = decodeDelta(value);
+        if (delta > 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
+            /* Twist right = execute */
+            if (pendingTwistAction.action === "toggle_loop") {
+                toggleLoop();
+            } else if (pendingTwistAction.action === "zero_cross") {
+                snapToZeroCrossing();
+            }
+            pendingTwistAction = null;
+        } else if (delta < 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
+            /* Twist left = cancel */
+            pendingTwistAction = null;
+            showStatus("Cancelled", 20);
         }
         return;
     }
@@ -3153,6 +3184,27 @@ function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
 
+    /* Knob touch: twist actions for E7 (loop) and E8 (zero crossing) */
+    if (velocity > 0) {
+        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+            pendingTwistAction = { cc: CC_E7, action: "toggle_loop" };
+            showStatus("Twist: Loop " + (loopEnabled ? "Off" : "On"), 9999);
+            return;
+        }
+        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+            pendingTwistAction = { cc: CC_E8, action: "zero_cross" };
+            showStatus("Twist: Zero Cross Snap", 9999);
+            return;
+        }
+    } else {
+        /* Touch release: cancel pending and clear prompt */
+        if ((note === MoveKnob7Touch || note === MoveKnob8Touch) && pendingTwistAction) {
+            pendingTwistAction = null;
+            statusTimer = 0;
+            statusMsg = "";
+        }
+    }
+
     /* Pad press/release: audition (hold to play, release to stop).
      * Only the most recently pressed pad owns playback — releasing
      * an earlier pad while a newer one is held does nothing. */
@@ -3162,9 +3214,9 @@ function handleNote(note, velocity) {
                 setLED(note, PAD_COLOR_PLAY);
                 activePadNote = note;
                 if (shiftHeld) {
-                    /* Shift+pad: preview from 10% before end marker */
+                    /* Shift+pad: preview from 3% before end marker */
                     var selLen = endSample - startSample;
-                    var previewLen = Math.max(Math.floor(selLen * 0.1), 1000);
+                    var previewLen = Math.min(Math.max(Math.floor(selLen * 0.05), Math.floor(sampleRate / 4)), sampleRate * 5);
                     var from = endSample - previewLen;
                     if (from < startSample) from = startSample;
                     startPlaybackFrom(from);
@@ -3290,6 +3342,35 @@ globalThis.tick = function() {
         if (!ledInitPending) {
             /* Init just finished — sync LEDs to current state */
             updateLeds();
+        }
+    }
+
+    /* Poll for sampler finalization after recording stop */
+    if (recordState === "stopping") {
+        recordStoppingTicks++;
+        if (typeof host_sampler_is_recording === "function" && !host_sampler_is_recording()) {
+            /* Sampler finished — load the recorded file */
+            recordState = "idle";
+            openedFilePath = recordFilePath;
+            host_module_set_param("file_path", "");
+            host_module_set_param("file_path", recordFilePath);
+            refreshFileInfo();
+            waveformDirty = true;
+            refreshWaveform();
+            refreshState();
+            announce("Loaded " + fileName);
+            showStatus("Recorded " + fileName, 90);
+        } else if (recordStoppingTicks > 220) {
+            /* Timeout (~5 sec) — load anyway */
+            recordState = "idle";
+            openedFilePath = recordFilePath;
+            host_module_set_param("file_path", "");
+            host_module_set_param("file_path", recordFilePath);
+            refreshFileInfo();
+            waveformDirty = true;
+            refreshWaveform();
+            refreshState();
+            showStatus("Recorded " + fileName, 90);
         }
     }
 
