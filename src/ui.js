@@ -3375,6 +3375,9 @@ globalThis.init = function() {
         if (stillRecording) {
             recordState = "recording";
             recordFilePath = openedFilePath;
+            recordWaveform = [];
+            recordWriteHead = 0;
+            recordStartTime = Date.now();  /* Approximate — real start time is lost */
             recordLedCounter = 0;
             currentView = VIEW_TRIM;
             selectedField = 0;
