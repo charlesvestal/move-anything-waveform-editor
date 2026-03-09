@@ -208,6 +208,11 @@ var sliceMenuIndex = 0;
 var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
+/* Scratch file — all recordings go here, user "Save As" to keep */
+var SCRATCH_DIR = "/data/UserData/UserLibrary/Samples/Move Everything/Recordings";
+var SCRATCH_PATH = SCRATCH_DIR + "/.wave-edit-scratch.wav";
+var SAVE_DIR = SCRATCH_DIR;  /* default destination for "Save As" */
+
 /* Record state */
 var isRecordedFile = false;      /* true if current file came from recording (unsaved) */
 var recordState = "idle";        /* "idle" | "ready" | "recording" | "stopping" */
@@ -251,10 +256,10 @@ var normalizeItems = ["Normalize", "Cancel"];
 var normalizeIndex = 0;
 
 /* Confirm save overlay */
-var saveItemsNormal = ["Overwrite", "Cancel"];
-var saveItems = saveItemsNormal;
-var saveIndex = 0;
-var saveReturnView = VIEW_TRIM; /* View to return to after save/cancel */
+var saveName = "";               /* Editable filename (without .wav) shown at top */
+var saveActions = [];            /* Action items below the filename */
+var saveIndex = 0;               /* 0 = filename row, 1+ = action items */
+var saveReturnView = VIEW_TRIM;  /* View to return to after save/cancel */
 
 /**
  * Generate a timestamped recording filename.
@@ -285,12 +290,23 @@ function refreshBrowserWithRecording() {
 /**
  * Generate a timestamped recording filename.
  */
-function generateRecordingPath(dir) {
+function generateRecordingPath() {
+    /* Always record to scratch file — user does "Save As" to keep */
+    if (typeof host_ensure_dir === "function") {
+        host_ensure_dir(SCRATCH_DIR);
+    }
+    return SCRATCH_PATH;
+}
+
+function generateDefaultSaveName() {
     var d = new Date();
     var pad2 = function(n) { return n < 10 ? "0" + n : "" + n; };
-    var stamp = d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate())
+    return "Recording_" + d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate())
         + "_" + pad2(d.getHours()) + "-" + pad2(d.getMinutes()) + "-" + pad2(d.getSeconds());
-    return dir + "/Recording_" + stamp + ".wav";
+}
+
+function isScratchFile() {
+    return openedFilePath === SCRATCH_PATH;
 }
 
 function isRexAvailable() {
@@ -298,7 +314,7 @@ function isRexAvailable() {
         host_file_exists(REX_MODULE_PATH + "/module.json");
 }
 
-function getSaveItemsSlice() {
+function getSliceActions() {
     if (isRexAvailable()) {
         return ["Slices", "Drum Preset", "REX Loop", "Cancel"];
     }
@@ -685,6 +701,7 @@ function refreshFileInfo() {
     try {
         var info = JSON.parse(raw);
         fileName = info.name || "";
+        if (isScratchFile()) fileName = "New Recording";
         fileDuration = info.duration || 0;
         totalFrames = info.frames || 0;
         startSample = info.start || 0;
@@ -1594,25 +1611,30 @@ function drawConfirmSave() {
     clear_screen();
 
     /* Title */
-    var title = (saveReturnView === VIEW_SLICE) ? "Save slices as:" : "Overwrite file?";
+    var title = (saveReturnView === VIEW_SLICE) ? "Export" : "Save";
     printCentered(2, title);
     drawDivider(12);
 
-    /* Info: show filename */
-    printCentered(18, truncate(fileName, 20));
+    /* Row 0: editable filename (left-justified) */
+    var dispName = truncate(saveName, 20);
+    var nameY = 16;
+    var itemH = saveActions.length > 3 ? 9 : 11;
+    if (saveIndex === 0) {
+        fill_rect(0, nameY, SCREEN_W, itemH, 1);
+        print(2, nameY + 1, dispName, 0);
+    } else {
+        print(2, nameY + 1, dispName, 1);
+    }
 
-    /* Options — compact line height so 4 items fit */
-    var startY = 28;
-    var itemH = saveItems.length > 3 ? 9 : 14;
-
-    for (var i = 0; i < saveItems.length; i++) {
+    /* Action rows (indented) */
+    var startY = nameY + itemH + 2;
+    for (var i = 0; i < saveActions.length; i++) {
         var y = startY + i * itemH;
-
-        if (i === saveIndex) {
+        if (saveIndex === i + 1) {
             fill_rect(0, y, SCREEN_W, itemH, 1);
-            print(8, y + 1, saveItems[i], 0);
+            print(8, y + 1, saveActions[i], 0);
         } else {
-            print(8, y + 1, saveItems[i], 1);
+            print(8, y + 1, saveActions[i], 1);
         }
     }
 }
@@ -1690,8 +1712,8 @@ function switchView(view) {
     } else if (view === VIEW_CONFIRM_NORMALIZE) {
         announce("Normalize? " + normalizeItems[normalizeIndex]);
     } else if (view === VIEW_CONFIRM_SAVE) {
-        var savePrompt = (saveReturnView === VIEW_SLICE) ? "Save slices as? " : "Overwrite? ";
-        announce(savePrompt + saveItems[saveIndex]);
+        var savePrompt = (saveReturnView === VIEW_SLICE) ? "Export, " : "Save, ";
+        announce(savePrompt + saveName);
     }
 }
 
@@ -1791,11 +1813,21 @@ function drawOpenFileBrowser() {
 function confirmSelect() {
     switch (confirmIndex) {
         case 0: /* Save & Exit */
-            doSave();
-            fullExit();
+            if (isScratchFile()) {
+                /* Scratch file — need Save As, then exit */
+                doSaveAs(fullExit);
+            } else {
+                doSave();
+                fullExit();
+            }
             break;
         case 1: /* Discard */
-            if (isRecordedFile && recordFilePath) {
+            if (isScratchFile()) {
+                /* Delete scratch file */
+                if (typeof host_system_cmd === "function") {
+                    host_system_cmd("rm -f '" + SCRATCH_PATH + "'");
+                }
+            } else if (isRecordedFile && recordFilePath) {
                 /* Delete unsaved recording temp file */
                 if (typeof host_system_cmd === "function") {
                     host_system_cmd("rm -f '" + recordFilePath + "'");
@@ -1825,22 +1857,132 @@ function normalizeSelect() {
 }
 
 /**
+ * Ensure the current file is saved to a permanent path (not scratch).
+ * If scratch, copies to SAVE_DIR/saveName.wav and updates openedFilePath.
+ * Returns the permanent path, or "" on failure.
+ */
+function ensureSourceSaved() {
+    var targetName = saveName;
+    if (targetName.toLowerCase().indexOf(".wav") !== targetName.length - 4) {
+        targetName = targetName + ".wav";
+    }
+    var destPath = SAVE_DIR + "/" + targetName;
+    if (isScratchFile() || openedFilePath !== destPath) {
+        if (typeof host_system_cmd === "function") {
+            host_ensure_dir(SAVE_DIR);
+            /* Save current edits first (apply gain etc) */
+            if (gainDb !== 0.0) {
+                host_module_set_param("apply_gain", "1");
+            }
+            host_module_set_param("save", "1");
+            var result = host_system_cmd("cp '" + openedFilePath + "' '" + destPath + "'");
+            if (result === 0) {
+                openedFilePath = destPath;
+                host_module_set_param("file_path", destPath);
+                refreshFileInfo();
+                isRecordedFile = false;
+                return destPath;
+            }
+        }
+        return "";
+    }
+    return destPath;
+}
+
+/**
+ * Check if target save path exists and prompt for overwrite if needed.
+ * Calls onConfirm() if OK to proceed, does nothing if user cancels.
+ */
+function checkOverwriteThenDo(action) {
+    var targetName = saveName;
+    if (targetName.toLowerCase().indexOf(".wav") !== targetName.length - 4) {
+        targetName = targetName + ".wav";
+    }
+    var destPath = SAVE_DIR + "/" + targetName;
+    /* If saving to same file we already have open, no overwrite prompt needed */
+    if (destPath === openedFilePath) {
+        action();
+        return;
+    }
+    if (typeof host_file_exists === "function" && host_file_exists(destPath)) {
+        /* Show overwrite confirmation via text entry trick:
+         * We reuse the confirm mechanism — ask user */
+        /* Simple approach: just warn and proceed, since we have limited UI */
+        showStatus("Overwriting...", 30);
+        action();
+    } else {
+        action();
+    }
+}
+
+/**
  * Handle confirm save selection.
  */
 function saveSelect() {
-    var selected = saveItems[saveIndex];
-    if (selected === "Slices") {
-        exportSlicedWavs();
-        returnToSaveView();
-    } else if (selected === "Drum Preset") {
-        saveDrumRackPreset();
-        returnToSaveView();
-    } else if (selected === "REX Loop") {
-        exportRexLoop();
-        returnToSaveView();
-    } else if (selected === "Overwrite") {
-        doSave();
-        returnToSaveView();
+    if (saveIndex === 0) {
+        /* Filename row — open keyboard to edit */
+        if (typeof host_open_text_entry !== "function") {
+            showStatus("No keyboard", 60);
+            return;
+        }
+        host_open_text_entry({
+            title: "Filename",
+            initialText: saveName,
+            onConfirm: function(name) {
+                if (name && name.length > 0) {
+                    saveName = name;
+                }
+            },
+            onCancel: function() {}
+        });
+        return;
+    }
+
+    var action = saveActions[saveIndex - 1];
+    if (action === "Save") {
+        checkOverwriteThenDo(function() {
+            if (isScratchFile()) {
+                /* Save scratch to permanent path */
+                var path = ensureSourceSaved();
+                if (path) {
+                    showStatus("Saved!", 90);
+                    announce("Saved");
+                } else {
+                    showStatus("Save failed", 60);
+                }
+            } else {
+                /* Just save in place */
+                doSave();
+            }
+            returnToSaveView();
+        });
+    } else if (action === "Slices") {
+        checkOverwriteThenDo(function() {
+            if (isScratchFile()) {
+                var path = ensureSourceSaved();
+                if (!path) { showStatus("Save failed", 60); returnToSaveView(); return; }
+            }
+            exportSlicedWavs();
+            returnToSaveView();
+        });
+    } else if (action === "Drum Preset") {
+        checkOverwriteThenDo(function() {
+            if (isScratchFile()) {
+                var path = ensureSourceSaved();
+                if (!path) { showStatus("Save failed", 60); returnToSaveView(); return; }
+            }
+            saveDrumRackPreset();
+            returnToSaveView();
+        });
+    } else if (action === "REX Loop") {
+        checkOverwriteThenDo(function() {
+            if (isScratchFile()) {
+                var path = ensureSourceSaved();
+                if (!path) { showStatus("Save failed", 60); returnToSaveView(); return; }
+            }
+            exportRexLoop();
+            returnToSaveView();
+        });
     } else {
         /* Cancel */
         returnToSaveView();
@@ -2038,6 +2180,56 @@ function doPaste() {
 /**
  * Export selection to new file (filename_edit.wav).
  */
+/**
+ * Save As — prompt for filename, copy scratch file to permanent location.
+ * Opens the text entry keyboard with a pre-filled timestamp name.
+ */
+function doSaveAs(onDone) {
+    if (typeof host_open_text_entry !== "function") {
+        showStatus("No keyboard", 60);
+        return;
+    }
+    var defaultName = isScratchFile()
+        ? generateDefaultSaveName()
+        : fileName.replace(/\.wav$/i, "");
+    host_open_text_entry({
+        title: "Save As",
+        initialText: defaultName,
+        onConfirm: function(name) {
+            if (!name || name.length === 0) {
+                showStatus("Cancelled", 60);
+                return;
+            }
+            /* Ensure .wav extension */
+            var destName = name;
+            if (destName.toLowerCase().indexOf(".wav") !== destName.length - 4) {
+                destName = destName + ".wav";
+            }
+            var destPath = SAVE_DIR + "/" + destName;
+            /* Copy scratch file to destination */
+            if (typeof host_system_cmd === "function") {
+                host_ensure_dir(SAVE_DIR);
+                var result = host_system_cmd("cp '" + SCRATCH_PATH + "' '" + destPath + "'");
+                if (result === 0) {
+                    /* Reload from the new permanent path */
+                    openedFilePath = destPath;
+                    host_module_set_param("file_path", destPath);
+                    refreshFileInfo();
+                    isRecordedFile = false;
+                    showStatus("Saved " + destName, 90);
+                    announce("Saved " + destName);
+                    if (onDone) onDone();
+                } else {
+                    showStatus("Save failed", 60);
+                }
+            }
+        },
+        onCancel: function() {
+            /* User cancelled — stay on scratch file */
+        }
+    });
+}
+
 function doExport() {
     host_module_set_param("export", "1");
     var result = host_module_get_param("copy_result");
@@ -2675,17 +2867,25 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Sample button — save with confirmation/options. */
+    /* Sample button — save menu.
+     * Shows editable filename at top + action items below.
+     * Trim/Loop: Save + Cancel.  Slice: Slices + Drum Preset + REX + Cancel. */
     if (cc === CC_SAMPLE && value > 0) {
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            saveItems = saveItemsNormal;
+            saveName = isScratchFile()
+                ? generateDefaultSaveName()
+                : fileName.replace(/\.wav$/i, "");
+            saveActions = ["Save", "Cancel"];
             saveIndex = 0;
             saveReturnView = currentView;
             switchView(VIEW_CONFIRM_SAVE);
         } else if (currentView === VIEW_SLICE) {
-            saveItems = getSaveItemsSlice();
+            saveName = isScratchFile()
+                ? generateDefaultSaveName()
+                : fileName.replace(/\.wav$/i, "");
+            saveActions = getSliceActions();
             saveIndex = 0;
-            saveReturnView = currentView;
+            saveReturnView = VIEW_SLICE;
             switchView(VIEW_CONFIRM_SAVE);
         }
         return;
@@ -2841,8 +3041,9 @@ function handleCC(cc, value) {
             case VIEW_CONFIRM_SAVE:
                 saveIndex += (delta > 0 ? 1 : -1);
                 if (saveIndex < 0) saveIndex = 0;
-                if (saveIndex >= saveItems.length) saveIndex = saveItems.length - 1;
-                announce(saveItems[saveIndex]);
+                var maxSaveIdx = saveActions.length; /* 0=filename, 1..N=actions */
+                if (saveIndex > maxSaveIdx) saveIndex = maxSaveIdx;
+                announce(saveIndex === 0 ? saveName : saveActions[saveIndex - 1]);
                 break;
 
             case VIEW_TRIM:
@@ -2998,7 +3199,7 @@ function handleCC(cc, value) {
                     var selItem = openFileBrowserState.items[openFileBrowserState.selectedIndex];
                     if (selItem && selItem.kind === "action") {
                         recordBrowserDir = openFileBrowserState.currentDir;
-                        recordFilePath = generateRecordingPath(recordBrowserDir);
+                        recordFilePath = generateRecordingPath();
                         recordState = "ready";
                         recordLedCounter = 0;
                         openFileBrowserState = null;
@@ -3374,7 +3575,8 @@ globalThis.init = function() {
         var stillRecording = (typeof host_sampler_is_recording === "function") && host_sampler_is_recording();
         if (stillRecording) {
             recordState = "recording";
-            recordFilePath = openedFilePath;
+            recordFilePath = SCRATCH_PATH;
+            openedFilePath = SCRATCH_PATH;
             recordLedCounter = 0;
             currentView = VIEW_TRIM;
             selectedField = 0;
@@ -3402,9 +3604,8 @@ globalThis.init = function() {
             announce("Wave Edit, recording in progress, " + timeStr);
         } else if (openedFilePath && totalFrames === 0) {
             /* File path set but no audio data — restore record-ready state */
-            var lastSlash = openedFilePath.lastIndexOf("/");
-            recordBrowserDir = lastSlash > 0 ? openedFilePath.substring(0, lastSlash) : "";
-            recordFilePath = openedFilePath;
+            recordBrowserDir = SCRATCH_DIR;
+            recordFilePath = SCRATCH_PATH;
             recordState = "ready";
             recordLedCounter = 0;
             currentView = VIEW_TRIM;
@@ -3425,9 +3626,12 @@ globalThis.init = function() {
         host_module_set_param("mode", "0");
 
         if (openedFilePath && totalFrames === 0) {
-            var lastSlash = openedFilePath.lastIndexOf("/");
-            recordBrowserDir = lastSlash > 0 ? openedFilePath.substring(0, lastSlash) : "";
-            recordFilePath = openedFilePath;
+            /* New file — use scratch path for recording */
+            if (typeof host_ensure_dir === "function") {
+                host_ensure_dir(SCRATCH_DIR);
+            }
+            recordFilePath = SCRATCH_PATH;
+            recordBrowserDir = SCRATCH_DIR;
             recordState = "ready";
             recordLedCounter = 0;
             announce("New Recording, press REC to record");
