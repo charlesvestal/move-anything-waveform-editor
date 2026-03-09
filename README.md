@@ -11,6 +11,10 @@ A full-featured audio waveform editor for your Ableton Move. Trim, gain adjust, 
 - Hold-to-audition playback with loop mode
 - Undo support for all destructive edits
 - Export selection to new file
+- **Slice mode**: Even, Auto (transient detection), and Lazy (real-time SP-2400 style chop)
+- **Slice export**: Save slices as individual WAVs, Drum Presets, or REX Loops
+- **Loop view**: Seam editor for creating seamless loops
+- **Recording**: Record from Resample, Line In, or any installed sound generator
 
 ## Prerequisites
 
@@ -37,24 +41,60 @@ cd move-anything-waveform-editor
 
 ## Controls
 
+### Edit Mode
+
 | Control | Function |
 |---------|----------|
 | Jog wheel | Move selected marker |
 | Jog click | Toggle start/end marker |
 | Knob 1 | Move start marker |
 | Knob 2 | Move end marker |
-| Knob 3 | Zoom (Shift: vertical scale) |
-| Knob 4 | Gain (Shift: normalize) |
-| Any pad | Hold to audition (Shift: full file) |
+| Knob 3 | Zoom |
+| Knob 4 | Vertical scale (1x–32x) |
+| Knob 5 | Gain (Shift: normalize) |
+| Any pad | Hold to audition selection |
+| Shift+Pad | Preview near end marker |
 | Mute | Zero out selection |
 | Copy | Copy selection |
 | Shift+Copy | Paste at cursor |
 | Delete | Cut selection |
-| Loop | Toggle loop mode |
-| Capture | Save (overwrite) |
-| Shift+Capture | Export selection |
+| Loop | Enter loop seam editor |
+| Capture | Enter slice mode |
+| Sample | Save (overwrite confirm) |
+| Shift+Capture | Export selection to new file |
 | Undo | Undo last edit |
 | Back | Exit (warns on unsaved) |
+
+### Slice Mode
+
+| Control | Function |
+|---------|----------|
+| Jog | Navigate footer (Mode, Count, Select) |
+| Jog click | Toggle edit/navigate |
+| Knob 1 | Adjust slice start |
+| Knob 2 | Adjust slice end |
+| Knob 3 | Zoom |
+| Knob 5 | Threshold (Auto mode) |
+| Pads | Select + audition slice |
+| Left/Right | Prev/next slice |
+| Down | Split slice at midpoint |
+| Up | Merge with previous slice |
+| Sample | Save as: Slices, Drum Preset, or REX Loop |
+| Capture | Exit slice mode |
+
+Slice modes: **Even** (fixed count), **Auto** (transient detection), **Lazy** (real-time chop, SP-2400 style)
+
+### Recording
+
+Select **New Recording** in the file browser to record audio.
+
+Choose a source: **Resample** (Move output), **Line In**, or any installed sound generator. Source plugins that have their own UI will open it for configuration — when playback starts, Wave Edit auto-returns and arms for recording.
+
+| Control | Function |
+|---------|----------|
+| REC | Start/stop recording |
+| Menu | Change recording source |
+| Back | Cancel recording |
 
 ## Header Indicators
 

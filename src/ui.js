@@ -1939,7 +1939,9 @@ function returnToSaveView() {
  */
 function refreshRecSourceModules() {
     recSourceModules = [];
-    /* Line In is always first — uses default resample recording */
+    /* Resample is always first — standard recording from Move output */
+    recSourceModules.push({ id: "__resample__", name: "Resample", abbrev: "RS" });
+    /* Line In */
     recSourceModules.push({ id: "__linein__", name: "Line In", abbrev: "LI" });
     if (typeof host_list_modules === "function") {
         var modules = host_list_modules();
@@ -1965,9 +1967,16 @@ function drawRecSourcePicker() {
 
     var startY = 14;
     var itemH = 10;
-    for (var i = 0; i < recSourceModules.length; i++) {
-        var y = startY + i * itemH;
-        if (y > 50) break;
+    var maxVisible = 4; /* items that fit between header and footer */
+    var scrollOffset = 0;
+    if (recSourceIndex >= maxVisible) {
+        scrollOffset = recSourceIndex - maxVisible + 1;
+    }
+
+    for (var vi = 0; vi < maxVisible; vi++) {
+        var i = vi + scrollOffset;
+        if (i >= recSourceModules.length) break;
+        var y = startY + vi * itemH;
 
         var mod = recSourceModules[i];
         var label = mod.name;
@@ -1983,6 +1992,10 @@ function drawRecSourcePicker() {
             print(isActive ? 12 : 2, y, label, 1);
         }
     }
+
+    /* Scroll indicators */
+    if (scrollOffset > 0) print(120, startY, "\x1e", 1);
+    if (scrollOffset + maxVisible < recSourceModules.length) print(120, startY + (maxVisible - 1) * itemH, "\x1f", 1);
 
     drawDivider(55);
     print(2, 57, "Jog:select  Back:cancel", 1);
@@ -2025,8 +2038,8 @@ function selectRecSource() {
         return;
     }
 
-    if (selected.id === "__linein__") {
-        /* Line In — disconnect any active source, use default resample recording */
+    if (selected.id === "__resample__" || selected.id === "__linein__") {
+        /* Resample / Line In — disconnect any active source, use default recording */
         if (recSourceActiveId) {
             host_source_unload();
             recSourceActiveId = null;
@@ -2037,10 +2050,10 @@ function selectRecSource() {
             recordState = "ready";
             recordLedCounter = 0;
             switchView(VIEW_TRIM);
-            announce("New Recording, press REC to record");
+            announce(selected.name + ", press REC to record");
         } else {
             switchView(VIEW_TRIM);
-            showStatus("Source: Line In", 60);
+            showStatus("Source: " + selected.name, 60);
         }
         return;
     }
@@ -2058,8 +2071,8 @@ function selectRecSource() {
     }
 
     /* Load new source — hand off to source plugin UI */
-    if (typeof host_launch_source_ui === "function") {
-        host_launch_source_ui(selected.id);
+    if (typeof globalThis.host_launch_source_ui === "function") {
+        globalThis.host_launch_source_ui(selected.id);
         /* Wave Edit will be unloaded and reloaded after user configures the source */
         return;
     }
@@ -3608,23 +3621,36 @@ globalThis.init = function() {
     selectedField = 0;
     host_module_set_param("mode", "0");
 
-    /* If the file didn't load (new file path), open rec source picker */
+    /* Check if a rec source is already active (returned from source UI handoff) */
+    var recSourceReturned = false;
+    if (typeof globalThis._recSourceJustConfigured === "string" && globalThis._recSourceJustConfigured) {
+        recSourceActiveId = globalThis._recSourceJustConfigured;
+        recSourceActiveAbbrev = recSourceActiveId;
+        recSourceReturned = true;
+        delete globalThis._recSourceJustConfigured;
+    } else if (typeof host_source_is_loaded === "function" && host_source_is_loaded()) {
+        recSourceActiveId = (typeof host_source_get_id === "function") ? host_source_get_id() : "unknown";
+        recSourceActiveAbbrev = (typeof host_source_get_abbrev === "function") ? host_source_get_abbrev() : "";
+        recSourceReturned = true;
+    }
+
+    /* If the file didn't load (new file path), set up for recording */
     if (openedFilePath && totalFrames === 0) {
         var lastSlash = openedFilePath.lastIndexOf("/");
         recordBrowserDir = lastSlash > 0 ? openedFilePath.substring(0, lastSlash) : "";
         recordFilePath = openedFilePath;
-        recSourceFromNewRecording = true;
-        openRecSourcePicker();
+        if (recSourceReturned) {
+            /* Returned from source UI handoff — go straight to record-ready */
+            recordState = "ready";
+            recordLedCounter = 0;
+            announce(recSourceActiveAbbrev + " ready, press REC to record");
+        } else {
+            /* Fresh new recording — open rec source picker */
+            recSourceFromNewRecording = true;
+            openRecSourcePicker();
+        }
     } else {
         announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
-    }
-
-    /* Check if a rec source is already active (returned from source UI handoff) */
-    if (typeof host_source_is_loaded === "function" && host_source_is_loaded()) {
-        recSourceActiveId = (typeof host_source_get_id === "function") ? host_source_get_id() : "unknown";
-        recSourceActiveAbbrev = (typeof host_source_get_abbrev === "function") ? host_source_get_abbrev() : "";
-        recSourceWaitingForAudio = true;
-        showStatus("Waiting for audio from " + recSourceActiveAbbrev, 120);
     }
 };
 
