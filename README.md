@@ -73,8 +73,10 @@ cd move-anything-waveform-editor
 | Knob 1 | Move start marker (in beat steps) |
 | Knob 2 | Move end marker (in beat steps) |
 | Knob 3 | Zoom |
-| Knob 5 | Set BPM (Shift: fine ±0.1) |
+| Knob 5 | Set BPM (Shift: fine ±0.1) — snaps end marker to beat grid |
 | Knob 6 | Set beat division (1/1–1/16) |
+| Copy | Read BPM from filename |
+| Shift+Copy | Estimate BPM from selection length (assumes 1 bar, 4/4) |
 | Left/Right | Move active marker by one division |
 | Shift+L/R | Move entire selection by one division |
 | Shift+Loop | Toggle loop on/off |

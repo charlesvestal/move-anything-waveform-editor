@@ -3059,18 +3059,31 @@ function handleCC(cc, value) {
     /* Copy button: normal = copy to clipboard, shift = paste */
     if (cc === CC_COPY && value > 0) {
         if (currentView === VIEW_BPM_TRIM) {
-            /* Extract BPM from filename (e.g. "loop_120bpm_dry.wav" → 120) */
-            var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
-            if (bpmMatch) {
-                var detectedBpm = parseFloat(bpmMatch[1]);
-                if (detectedBpm >= 20 && detectedBpm <= 999) {
-                    bpm = Math.round(detectedBpm * 10) / 10;
-                    showStatus("BPM: " + bpm.toFixed(1), 90);
-                } else {
-                    showStatus("BPM out of range", 60);
+            if (shiftHeld) {
+                /* Shift+Copy: estimate BPM from selection length (assumes 1 bar in 4/4) */
+                var selLen = endSample - startSample;
+                if (selLen <= 0) { showStatus("Empty selection", 60); return; }
+                var estimatedBpm = 240.0 / (selLen / sampleRate); /* 4 beats × 60s */
+                estimatedBpm = Math.round(estimatedBpm * 10) / 10;
+                if (estimatedBpm < 20 || estimatedBpm > 999) {
+                    showStatus("BPM out of range", 60); return;
                 }
+                bpm = estimatedBpm;
+                showStatus("BPM: " + bpm.toFixed(1), 90);
             } else {
-                showStatus("No BPM in filename", 60);
+                /* Copy: extract BPM from filename (e.g. "loop_120bpm_dry.wav" → 120) */
+                var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
+                if (bpmMatch) {
+                    var detectedBpm = parseFloat(bpmMatch[1]);
+                    if (detectedBpm >= 20 && detectedBpm <= 999) {
+                        bpm = Math.round(detectedBpm * 10) / 10;
+                        showStatus("BPM: " + bpm.toFixed(1), 90);
+                    } else {
+                        showStatus("BPM out of range", 60);
+                    }
+                } else {
+                    showStatus("No BPM in filename", 60);
+                }
             }
             return;
         }
@@ -3723,6 +3736,13 @@ function handleCC(cc, value) {
             if (bpm < 20) bpm = 20;
             if (bpm > 999) bpm = 999;
             bpm = Math.round(bpm * 10) / 10;
+            /* Snap end marker so selection stays a multiple of one beat division */
+            var beatStep = getBeatStepSamples();
+            var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
+            endSample = startSample + beats * beatStep;
+            if (endSample > totalFrames) endSample = totalFrames;
+            syncMarkersToDs();
+            refreshWaveform();
             showKnobStatus(4, "BPM:" + bpm.toFixed(1));
             return;
         }
