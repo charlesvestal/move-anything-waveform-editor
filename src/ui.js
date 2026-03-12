@@ -270,7 +270,7 @@ var normalizeItems = ["Normalize", "Cancel"];
 var normalizeIndex = 0;
 
 /* Jog-click context menus (VIEW_TRIM) */
-var jogMenuItems = ["Copy", "Cut", "Truncate", "Normalize Sel", "BPM Step", "Mute"];
+var jogMenuItems = ["Copy", "Cut", "Mute", "Truncate", "Normalize Sel"];
 var jogMenuIndex = 0;
 var jogMenuScrollOffset = 0;
 var JOG_MENU_VISIBLE = 4;
@@ -3119,45 +3119,8 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Copy button: BPM view = BPM from filename / BPM from selection; Trim/Loop = copy/paste */
+    /* Copy button: Trim/Loop = copy/paste */
     if (cc === CC_COPY && value > 0) {
-        if (currentView === VIEW_BPM_TRIM) {
-            if (shiftHeld) {
-                /* Shift+Copy: estimate BPM — selection = 4 beat steps at current division.
-                 * bpm = 960 / (duration * div): at 1/4 select 1 bar, at 1/1 select 4 bars. */
-                var selLen = endSample - startSample;
-                if (selLen <= 0) { showStatus("Empty selection", 60); return; }
-                var div = BEAT_DIVISIONS[beatDivIndex];
-                var estimatedBpm = 960.0 / (selLen / sampleRate * div);
-                estimatedBpm = Math.round(estimatedBpm * 10) / 10;
-                if (estimatedBpm < 20 || estimatedBpm > 999) {
-                    showStatus("BPM out of range", 60); return;
-                }
-                bpm = estimatedBpm;
-                showStatus("BPM: " + bpm.toFixed(1), 90);
-            } else {
-                /* Copy: extract BPM from filename (e.g. "loop_120bpm_dry.wav" → 120) */
-                var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
-                if (bpmMatch) {
-                    var detectedBpm = parseFloat(bpmMatch[1]);
-                    if (detectedBpm >= 20 && detectedBpm <= 999) {
-                        bpm = Math.round(detectedBpm * 10) / 10;
-                        var beatStep = getBeatStepSamples();
-                        var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
-                        endSample = startSample + beats * beatStep;
-                        if (endSample > totalFrames) endSample = totalFrames;
-                        syncMarkersToDs();
-                        refreshWaveform();
-                        showStatus("BPM: " + bpm.toFixed(1), 90);
-                    } else {
-                        showStatus("BPM out of range", 60);
-                    }
-                } else {
-                    showStatus("No BPM in filename", 60);
-                }
-            }
-            return;
-        }
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
             if (shiftHeld) {
                 doPaste();
@@ -3227,11 +3190,41 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Capture button — Shift+Capture: export selection to new file */
+    /* Capture button — set start/end marker via BPM snapping in BPM view */
     if (cc === CC_CAPTURE && value > 0) {
-        if (shiftHeld) {
-            if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_SLICE) {
-                doExport();
+        if (currentView === VIEW_BPM_TRIM) {
+            if (shiftHeld) {
+                /* Shift+Capture: estimate BPM from selection */
+                var selLen = endSample - startSample;
+                if (selLen <= 0) { showStatus("Empty selection", 60); return; }
+                var div = BEAT_DIVISIONS[beatDivIndex];
+                var estimatedBpm = 960.0 / (selLen / sampleRate * div);
+                estimatedBpm = Math.round(estimatedBpm * 10) / 10;
+                if (estimatedBpm < 20 || estimatedBpm > 999) {
+                    showStatus("BPM out of range", 60); return;
+                }
+                bpm = estimatedBpm;
+                showStatus("BPM: " + bpm.toFixed(1), 90);
+            } else {
+                /* Capture: extract BPM from filename and snap end marker to beat grid */
+                var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
+                if (bpmMatch) {
+                    var detectedBpm = parseFloat(bpmMatch[1]);
+                    if (detectedBpm >= 20 && detectedBpm <= 999) {
+                        bpm = Math.round(detectedBpm * 10) / 10;
+                        var beatStep = getBeatStepSamples();
+                        var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
+                        endSample = startSample + beats * beatStep;
+                        if (endSample > totalFrames) endSample = totalFrames;
+                        syncMarkersToDs();
+                        refreshWaveform();
+                        showStatus("BPM: " + bpm.toFixed(1), 90);
+                    } else {
+                        showStatus("BPM out of range", 60);
+                    }
+                } else {
+                    showStatus("No BPM in filename", 60);
+                }
             }
         }
         return;
@@ -3450,6 +3443,8 @@ function handleCC(cc, value) {
                     if (zoomCenter > totalFrames - visHalf) zoomCenter = totalFrames - visHalf;
                     refreshWaveform();
                     showJogStatus("Pos:" + formatTime(getVisibleStart()));
+                } else {
+                    showStatus("Nothing to pan", 30);
                 }
                 break;
 
@@ -3488,6 +3483,8 @@ function handleCC(cc, value) {
                     if (zoomCenter > totalFrames - visHalf2) zoomCenter = totalFrames - visHalf2;
                     refreshWaveform();
                     showJogStatus("Pos:" + formatTime(getVisibleStart()));
+                } else {
+                    showStatus("Nothing to pan", 30);
                 }
                 break;
 
@@ -3552,10 +3549,9 @@ function handleCC(cc, value) {
                 switch (jogMenuIndex) {
                     case 0: doCopy(); break;
                     case 1: doCut(); break;
-                    case 2: doTrim(); break;
-                    case 3: doNormalizeSelection(); break;
-                    case 4: switchView(VIEW_BPM_TRIM); return; /* don't switch back to TRIM */
-                    case 5: doMute(); break;
+                    case 2: doMute(); break;
+                    case 3: doTrim(); break;
+                    case 4: doNormalizeSelection(); break;
                 }
                 switchView(VIEW_TRIM);
                 break;
