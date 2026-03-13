@@ -14,24 +14,28 @@
  * count. decodeDelta() returns the signed count for proportional response.
  *
  * Controls:
- *   Jog wheel    - Move selected marker  |  Menu: navigate
- *   Jog click    - Toggle start/end field |  Menu: select item
- *   E1 (Knob 1)  - Move start marker
- *   E2 (Knob 2)  - Move end marker
- *   E3 (Knob 3)  - Zoom in/out  |  Shift: vertical scale (1x-32x)
- *   E4 (Knob 4)  - Adjust gain  |  Shift: normalize (confirm overlay)
- *   Any pad      - Hold to audition selection, release to stop
- *   Mute         - Mute (zero out) selection
- *   Copy         - Copy selection to clipboard
- *   Shift+Copy   - Paste clipboard at cursor (insert)
- *   Delete       - Cut selection to clipboard (copy + remove)
- *   Shift+Capture- Export selection to new file
- *   Capture      - Save (overwrite confirmation)
- *   Undo         - Undo last destructive operation
- *   Loop         - Toggle loop mode
- *   Left/Right   - Nudge selection by one coarse step
- *   Shift+L/R    - Jump selection by one selection length
- *   Back         - Navigate back / exit
+ *   Jog wheel     - Scroll view (zoomed, clamped to file bounds)  |  Menu: navigate
+ *   Jog click     - Edit menu (Copy/Cut/Truncate/Normalize/BPM Step)  |  Shift: Paste/Export menu  |  other views: select item
+ *   E1 (Knob 1)   - Move start marker
+ *   E2 (Knob 2)   - Move end marker
+ *   E3 (Knob 3)   - Zoom in/out  |  Shift: vertical scale (1x-32x)
+ *   E4 (Knob 4)   - Adjust gain  |  Shift: normalize (confirm overlay)
+ *   Any pad       - Hold to audition selection, release to stop
+ *   Mute          - Mute (zero out) selection (all views)
+ *   Copy          - Copy selection  |  Slice: copy selected slice
+ *   Shift+Copy    - Paste at cursor (insert)  |  Slice: paste insert before selected slice
+ *   Remove        - Cut selection (copy + remove)  |  Slice: cut selected slice
+ *   Shift+L/R     - Jump selection by one length  |  Slice: move selected slice left/right
+ *   Down          - (BPM) Read BPM from filename
+ *   Up            - (BPM) Estimate BPM from selection length
+ *   Step 15       - Set start marker at playback position (Trim/BPM)
+ *   Step 16       - Set end marker at playback position (Trim/BPM)
+ *   Shift+Capture - Export selection to new file
+ *   Capture       - Save (overwrite confirmation)
+ *   Undo          - Undo last destructive operation
+ *   Loop          - Toggle loop mode
+ *   Left/Right    - Nudge selection by one coarse step  |  Slice: select prev/next slice
+ *   Back          - Navigate back / exit
  */
 
 import * as os from 'os';
@@ -43,9 +47,10 @@ import {
     MoveCapture, MoveRec, MoveSample, MoveUndo, MoveLoop, MoveCopy, MoveMute, MoveDelete,
     MoveLeft, MoveRight, MoveDown, MoveUp,
     MovePads,
-    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob7, MoveKnob8,
-    MoveKnob5Touch, MoveKnob7Touch, MoveKnob8Touch,
-    White, Black, DarkGrey, LightGrey, BrightRed,
+    MoveStep1,
+    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob6, MoveKnob7, MoveKnob8,
+    MoveKnob5Touch, MoveKnob6Touch, MoveKnob7Touch, MoveKnob8Touch,
+    White, Black, DarkGrey, LightGrey, BrightRed, OrangeRed, BrightGreen, VividYellow, Blue,
     WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright
 } from '/data/UserData/move-anything/shared/constants.mjs';
 
@@ -78,6 +83,9 @@ var VIEW_LOOP = 6;
 var VIEW_CONFIRM_SAVE = 7;
 var VIEW_OPEN_FILE = 8;
 var VIEW_SLICE = 9;
+var VIEW_JOG_MENU = 10;
+var VIEW_JOG_SHIFT_MENU = 11;
+var VIEW_BPM_TRIM = 12;
 
 /* MIDI CCs — use shared constants */
 var CC_JOG = MoveMainKnob;
@@ -87,16 +95,17 @@ var CC_E2 = MoveKnob2;
 var CC_E3 = MoveKnob3;
 var CC_E4 = MoveKnob4;
 var CC_E5 = MoveKnob5;
+var CC_E6 = MoveKnob6;
 var CC_E7 = MoveKnob7;
 var CC_E8 = MoveKnob8;
 var CC_SHIFT = MoveShift;
 var CC_BACK = MoveBack;
 var CC_MUTE = MoveMute;
 var CC_DELETE = MoveDelete;
+var CC_CAPTURE = MoveCapture;
 var CC_COPY = MoveCopy;
 var CC_UNDO = MoveUndo;
 var CC_LOOP = MoveLoop;
-var CC_CAPTURE = MoveCapture;
 var CC_LEFT = MoveLeft;
 var CC_RIGHT = MoveRight;
 var CC_DOWN = MoveDown;
@@ -107,6 +116,9 @@ var CC_REC = MoveRec;
 /* Pad note range */
 var PAD_NOTE_MIN = MovePads[0];
 var PAD_NOTE_MAX = MovePads[MovePads.length - 1];
+
+/* Step button base note */
+var STEP_BASE = MoveStep1; /* Steps 1–16 = notes 16–31 */
 
 /* Display geometry */
 var SCREEN_W = 128;
@@ -187,10 +199,17 @@ var cachedSeamHalf = -1;
 /* Loop view selected field: 0=start (loop point), 1=end */
 var loopSelectedField = 0;
 
+/* BPM state */
+var bpm = 120.0;
+var beatDivIndex = 2;  /* default: 1/4 */
+var BEAT_DIVISIONS = [1, 2, 4, 8, 16];
+var BEAT_DIVISION_LABELS = ["1/1", "1/2", "1/4", "1/8", "1/16"];
+
 /* Slice state */
 var SLICE_MODE_EVEN = 0;
 var SLICE_MODE_AUTO = 1;
 var SLICE_MODE_LAZY = 2;
+var SLICE_MODE_BPM = 3;
 var sliceMode = SLICE_MODE_EVEN;
 
 /* Lazy chop sub-modes */
@@ -254,6 +273,14 @@ var confirmIndex = 0;
 /* Confirm normalize overlay */
 var normalizeItems = ["Normalize", "Cancel"];
 var normalizeIndex = 0;
+
+/* Jog-click context menus (VIEW_TRIM) */
+var jogMenuItems = ["Copy", "Cut", "Mute", "Truncate", "Normalize Sel"];
+var jogMenuIndex = 0;
+var jogMenuScrollOffset = 0;
+var JOG_MENU_VISIBLE = 4;
+var jogShiftMenuItems = ["Paste (insert)", "Paste (overwrite)", "Export"];
+var jogShiftMenuIndex = 0;
 
 /* Confirm save overlay */
 var saveName = "";               /* Editable filename (without .wav) shown at top */
@@ -455,19 +482,34 @@ function initLedsStep() {
 
     var commands = [];
 
-    /* Button LEDs — dim to show they're active */
-    commands.push(function() { setButtonLED(CC_MUTE, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_DELETE, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_COPY, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_UNDO, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_LOOP, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_CAPTURE, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_BACK, LED_DIM); });
+    /* Button LEDs — init all to OFF, updateLeds() will set per-view state */
+    commands.push(function() { setButtonLED(CC_COPY, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_MUTE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_DELETE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_CAPTURE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_SAMPLE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_UNDO, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_LOOP, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_BACK, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_LEFT, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_RIGHT, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_UP, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_DOWN, LED_OFF, true); });
 
-    /* Pad LEDs — dim grey to show audition is available */
+    /* Step view-selector LEDs (Steps 1–3) — init to Black */
+    for (var s = 0; s < 3; s++) {
+        commands.push((function(n) {
+            return function() { setLED(n, Black, true); };
+        })(STEP_BASE + s));
+    }
+    /* Step 15/16 marker-set LEDs — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 14, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 15, Black, true); });
+
+    /* Pad LEDs — force=true ensures hardware is in sync on reconnect */
     for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
         commands.push((function(note) {
-            return function() { setLED(note, PAD_COLOR_DIM); };
+            return function() { setLED(note, PAD_COLOR_DIM, true); };
         })(p));
     }
 
@@ -489,9 +531,52 @@ function initLedsStep() {
  */
 function updateLeds() {
     if (ledInitPending) return; /* Don't send until init completes */
-    setButtonLED(CC_LOOP, loopEnabled ? LED_BRIGHT : LED_DIM);
-    setButtonLED(CC_UNDO, hasUndo ? LED_MED : LED_DIM);
-    setButtonLED(CC_COPY, hasClipboard ? LED_MED : LED_DIM);
+
+    var isTrim  = (currentView === VIEW_TRIM);
+    var isBpm   = (currentView === VIEW_BPM_TRIM);
+    var isSlice = (currentView === VIEW_SLICE);
+    var isLoop  = (currentView === VIEW_LOOP);
+    var isEdit  = isTrim || isBpm || isSlice || isLoop;
+
+    /* Buttons available in all edit views */
+    setButtonLED(CC_COPY,    isEdit  ? LED_DIM : LED_OFF);
+    setButtonLED(CC_MUTE,    isEdit  ? LED_DIM : LED_OFF);
+    setButtonLED(CC_BACK,    isEdit  ? LED_DIM : LED_OFF);
+    setButtonLED(CC_SAMPLE,  isEdit  ? LED_OFF : LED_OFF);
+
+    /* Remove: Trim, BPM, Slice, Loop */
+    setButtonLED(CC_DELETE,  isEdit  ? LED_DIM : LED_OFF);
+
+    /* Undo: stateful brightness */
+    setButtonLED(CC_UNDO,    isEdit  ? (hasUndo ? LED_MED : LED_DIM) : LED_OFF);
+
+    /* Loop: Trim, BPM, Loop (not Slice) */
+    setButtonLED(CC_LOOP,    (isTrim || isBpm || isLoop) ? (loopEnabled ? LED_BRIGHT : LED_DIM) : LED_OFF);
+
+    /* Capture: Trim, BPM, Slice (Shift+Capture = export) */
+    setButtonLED(CC_CAPTURE, (isTrim || isBpm || isSlice) ? LED_DIM : LED_OFF);
+
+    /* Left/Right: Trim, BPM, Slice */
+    setButtonLED(CC_LEFT,  (isTrim || isBpm || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_RIGHT, (isTrim || isBpm || isSlice) ? LED_DIM : LED_OFF);
+
+    /* Up/Down: BPM, Slice */
+    setButtonLED(CC_UP,   (isBpm || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_DOWN, (isBpm || isSlice) ? LED_DIM : LED_OFF);
+
+    /* Step view-selector LEDs */
+    setLED(STEP_BASE + 0, isTrim  ? White     : DarkGrey);
+    setLED(STEP_BASE + 1, isBpm   ? LightGrey : DarkGrey);
+    setLED(STEP_BASE + 2, isSlice ? OrangeRed : DarkGrey);
+
+    /* Step 9/10: fade in/out LEDs (Trim/BPM/Slice) */
+    var hasFade = isTrim || isBpm || isSlice;
+    setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
+    setLED(STEP_BASE + 9,  hasFade ? Blue   : Black);
+
+    /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
+    setLED(STEP_BASE + 14, (isTrim || isBpm) ? BrightGreen : Black);
+    setLED(STEP_BASE + 15, (isTrim || isBpm) ? BrightRed : isSlice ? BrightRed : Black);
 }
 
 /* ============ Helpers ============ */
@@ -647,6 +732,16 @@ function getCoarseStep() {
     var step = Math.floor(visibleRange / SCREEN_W);
     if (step < 1) step = 1;
     return step;
+}
+
+/**
+ * Get step size in samples for the current BPM and beat division.
+ */
+function getBeatStepSamples() {
+    var beatsPerSec = bpm / 60.0;
+    var samplesPerQuarter = sampleRate / beatsPerSec;
+    var div = BEAT_DIVISIONS[beatDivIndex];
+    return Math.max(1, Math.round(samplesPerQuarter * 4 / div));
 }
 
 /**
@@ -921,6 +1016,22 @@ function recomputeSliceBoundaries() {
         sliceBoundaries = [];
         for (var i = 0; i <= sliceCount; i++) {
             sliceBoundaries.push(sliceRegionStart + Math.round((regionLen * i) / sliceCount));
+        }
+    } else if (sliceMode === SLICE_MODE_BPM) {
+        var stepSamples = getBeatStepSamples();
+        sliceBoundaries = [sliceRegionStart];
+        var pos = sliceRegionStart + stepSamples;
+        while (pos < sliceRegionEnd) {
+            sliceBoundaries.push(pos);
+            pos += stepSamples;
+        }
+        sliceBoundaries.push(sliceRegionEnd);
+        sliceCount = sliceBoundaries.length - 1;
+        if (sliceCount < 1) sliceCount = 1;
+        if (sliceCount > 32) {
+            sliceCount = 32;
+            sliceBoundaries = sliceBoundaries.slice(0, 33);
+            sliceBoundaries[32] = sliceRegionEnd;
         }
     } else {
         /* Auto: transient detection */
@@ -1542,30 +1653,35 @@ function drawSliceView() {
         printCentered(54, footerStatus);
     } else {
         /* Build footer items based on slice menu */
-        var modeLabel = sliceMode === SLICE_MODE_EVEN ? "Even" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Lazy");
-        var countLabel;
-        if (sliceMode === SLICE_MODE_LAZY) {
-            countLabel = lazySub === LAZY_SUB_CHOP ? "Chop" : "Play";
-        } else if (sliceMode === SLICE_MODE_EVEN) {
-            countLabel = "" + sliceCount;
-        } else {
-            countLabel = "T:" + sliceThreshold.toFixed(1);
-        }
         var selLabel = (selectedSlice + 1) + "/" + sliceCount;
         if (sliceCount > 32) {
             var bankNum = Math.floor(slicePadOffset / 32) + 1;
             selLabel += " P" + bankNum;
         }
         var timeLabel = formatTime(startSample);
+        var labels;
+        if (sliceMode === SLICE_MODE_BPM) {
+            labels = ["BPM", bpm.toFixed(1), BEAT_DIVISION_LABELS[beatDivIndex], selLabel];
+        } else {
+            var modeLabel = sliceMode === SLICE_MODE_EVEN ? "Even" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Lazy");
+            var countLabel;
+            if (sliceMode === SLICE_MODE_LAZY) {
+                countLabel = lazySub === LAZY_SUB_CHOP ? "Chop" : "Play";
+            } else if (sliceMode === SLICE_MODE_EVEN) {
+                countLabel = "" + sliceCount;
+            } else {
+                countLabel = "T:" + sliceThreshold.toFixed(1);
+            }
+            labels = [modeLabel, countLabel, selLabel];
+        }
 
         /* Draw footer items with visual distinction:
          * - Focused (navigating): [brackets]
          * - Editing (active): inverse highlight (filled rect + dark text) */
-        var labels = [modeLabel, countLabel, selLabel];
         var CHAR_W = 6; /* 5px char + 1px gap */
         var footerY = 54;
         var x = 0;
-        for (var fi = 0; fi < 3; fi++) {
+        for (var fi = 0; fi < labels.length; fi++) {
             var label = labels[fi];
             var isFocused = (fi === sliceMenuIndex);
             var isEditing = isFocused && sliceMenuEditing;
@@ -1707,6 +1823,69 @@ function drawConfirmSave() {
     }
 }
 
+/* ============ Drawing: Jog Menu ============ */
+
+function drawJogMenu() {
+    clear_screen();
+    printCentered(2, "Edit");
+    drawDivider(12);
+    var startY = 14;
+    var itemH = 12;
+    var end = Math.min(jogMenuScrollOffset + JOG_MENU_VISIBLE, jogMenuItems.length);
+    for (var i = jogMenuScrollOffset; i < end; i++) {
+        var y = startY + (i - jogMenuScrollOffset) * itemH;
+        if (i === jogMenuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 2, jogMenuItems[i], 0);
+        } else {
+            print(8, y + 2, jogMenuItems[i], 1);
+        }
+    }
+    if (jogMenuScrollOffset > 0) print(SCREEN_W - 6, startY, "^", 1);
+    if (end < jogMenuItems.length) print(SCREEN_W - 6, startY + (JOG_MENU_VISIBLE - 1) * itemH, "v", 1);
+}
+
+/* ============ Drawing: Jog Shift Menu ============ */
+
+function drawJogShiftMenu() {
+    clear_screen();
+    printCentered(2, "Paste / Export");
+    drawDivider(12);
+    var startY = 14;
+    var itemH = 16;
+    for (var i = 0; i < jogShiftMenuItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === jogShiftMenuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 4, jogShiftMenuItems[i], 0);
+        } else {
+            print(8, y + 4, jogShiftMenuItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: BPM Trim ============ */
+
+function drawBpmTrim() {
+    /* Reuse trim view, then overlay BPM label and status bar */
+    drawTrimView();
+
+    /* Replace "TRIM" header label with "BPM" (keep dirty/loop indicators) */
+    var trimHeader = buildModeHeader("TRIM");
+    var bpmHeader  = buildModeHeader("BPM");
+    var eraseW = Math.max(trimHeader.length, bpmHeader.length) * 6 + 2;
+    fill_rect(0, 0, eraseW, 10, 0);
+    print(0, 0, bpmHeader, 1);
+
+    /* Overwrite the status area at very bottom with BPM info (unless a timed status is showing) */
+    if (statusTimer <= 0) {
+        var bpmStatus = "BPM:" + bpm.toFixed(1) + " " + BEAT_DIVISION_LABELS[beatDivIndex] +
+                        "  " + (selectedField === 0 ? "[Start]" : "[End]");
+        fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
+        print(0, SCREEN_H - 9, bpmStatus, 1);
+    }
+}
+
 /* ============ Navigation & Actions ============ */
 
 /**
@@ -1718,6 +1897,10 @@ function switchView(view) {
         refreshState();
         refreshWaveform();
         updateLeds();
+        /* Reset pad LEDs — may be stale from slice mode */
+        for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
+            setLED(p, PAD_COLOR_DIM);
+        }
         announce("Edit, " + fileName);
     } else if (view === VIEW_LOOP) {
         /* Auto-enable loop when entering loop mode */
@@ -1728,7 +1911,20 @@ function switchView(view) {
         refreshState();
         invalidateSeamWaveform();
         updateLeds();
+        /* Reset pad LEDs — may be stale from slice mode */
+        for (var p2 = PAD_NOTE_MIN; p2 <= PAD_NOTE_MAX; p2++) {
+            setLED(p2, PAD_COLOR_DIM);
+        }
         announce("Loop, " + fileName);
+    } else if (view === VIEW_BPM_TRIM) {
+        refreshState();
+        refreshWaveform();
+        updateLeds();
+        /* Reset pad LEDs — may be stale from slice mode */
+        for (var p3 = PAD_NOTE_MIN; p3 <= PAD_NOTE_MAX; p3++) {
+            setLED(p3, PAD_COLOR_DIM);
+        }
+        announce("BPM, " + fileName);
     } else if (view === VIEW_SLICE) {
         /* Disable looping for slice audition */
         savedLoopState = loopEnabled;
@@ -1743,15 +1939,32 @@ function switchView(view) {
             sliceRegionEnd = totalFrames;
             sliceRegionStart = 0;
         }
-        sliceCount = 1;
-        selectedSlice = 0;
-        slicePadOffset = 0;
         sliceMenuIndex = 0;
         sliceMenuEditing = false;
         lazyChopping = false;
-        if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
-        recomputeSliceBoundaries();
-        selectSlice(0);
+
+        /* Restore existing slice state if the region is unchanged (boundaries still match).
+         * This preserves manual adjustments and lazy-chop results across view switches
+         * for all modes (Even, Auto, BPM, Lazy). */
+        var hasExistingState = sliceBoundaries.length >= 2 &&
+            sliceRegionStart === sliceBoundaries[0] &&
+            sliceRegionEnd === sliceBoundaries[sliceBoundaries.length - 1];
+
+        if (hasExistingState) {
+            sliceCount = sliceBoundaries.length - 1;
+            if (selectedSlice >= sliceCount) selectedSlice = 0;
+            /* Lazy: set sub-mode based on whether real chops have been done */
+            if (sliceMode === SLICE_MODE_LAZY) {
+                lazySub = (sliceBoundaries.length >= 3) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
+            }
+        } else {
+            sliceCount = 1;
+            selectedSlice = 0;
+            slicePadOffset = 0;
+            if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
+            recomputeSliceBoundaries();
+        }
+        selectSlice(selectedSlice);
         /* Zoom to fit the slice region with 10% margin on each side */
         var regionLen = sliceRegionEnd - sliceRegionStart;
         if (regionLen > 0 && regionLen < totalFrames) {
@@ -1768,6 +1981,7 @@ function switchView(view) {
         syncMarkersToDs();
         refreshState();
         refreshWaveform();
+        updateLeds();
         updateSlicePadLeds();
         var sliceAnnounce = "Slice";
         if (sliceMode === SLICE_MODE_LAZY) sliceAnnounce += " Lazy Chop";
@@ -2249,6 +2463,24 @@ function doMute() {
     updateLeds();
 }
 
+function doFadeIn() {
+    syncMarkersToDs();
+    host_module_set_param("fade_in", "1");
+    showStatus("Fade in", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+}
+
+function doFadeOut() {
+    syncMarkersToDs();
+    host_module_set_param("fade_out", "1");
+    showStatus("Fade out", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+}
+
 /**
  * Cut selection to clipboard (copy + remove).
  */
@@ -2277,6 +2509,266 @@ function doPaste() {
     refreshState();
     invalidateWaveform();
     updateLeds();
+}
+
+/**
+ * Paste clipboard at cursor (overwrite at start_sample, file length unchanged).
+ */
+function doPasteOverwrite() {
+    refreshState();
+    if (!hasClipboard) {
+        showStatus("Nothing to paste", 45);
+        return;
+    }
+    host_module_set_param("paste_overwrite", "1");
+    showStatus("Pasted (overwrite)", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Copy selected slice audio to clipboard.
+ */
+function doSliceCopy() {
+    startSample = sliceBoundaries[selectedSlice];
+    endSample = sliceBoundaries[selectedSlice + 1];
+    syncMarkersToDs();
+    host_module_set_param("copy", "1");
+    hasClipboard = true;
+    showStatus("Copied Slice " + (selectedSlice + 1), 60);
+    updateLeds();
+}
+
+/**
+ * Paste clipboard overwrite into selected slice (file length unchanged).
+ */
+function doSlicePasteOverwrite() {
+    if (!hasClipboard) { showStatus("Nothing to paste", 45); return; }
+    startSample = sliceBoundaries[selectedSlice];
+    endSample = sliceBoundaries[selectedSlice + 1];
+    syncMarkersToDs();
+    host_module_set_param("paste_overwrite", "1");
+    showStatus("Pasted \u2192 Slice " + (selectedSlice + 1), 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Cut selected slice audio out of file, update boundaries.
+ * Requires at least 2 slices (can't cut the last one).
+ */
+function doSliceCut() {
+    if (sliceCount <= 1) { showStatus("Last slice", 45); return; }
+    var sliceStart = sliceBoundaries[selectedSlice];
+    var sliceEnd   = sliceBoundaries[selectedSlice + 1];
+    var sliceLen   = sliceEnd - sliceStart;
+    startSample = sliceStart;
+    endSample   = sliceEnd;
+    syncMarkersToDs();
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("cut", "1", 5000);
+    } else {
+        host_module_set_param("cut", "1");
+        host_module_get_param("dirty"); /* sync barrier: wait for cut to complete */
+    }
+    hasClipboard = true;
+    refreshFileInfo();
+    refreshState();
+    hasClipboard = true; /* re-assert: refreshState() may have read stale DSP state */
+    /* Remove end boundary of cut slice; shift all following boundaries left */
+    sliceBoundaries.splice(selectedSlice + 1, 1);
+    for (var i = selectedSlice + 1; i < sliceBoundaries.length; i++) {
+        sliceBoundaries[i] -= sliceLen;
+    }
+    sliceCount    = sliceBoundaries.length - 1;
+    sliceRegionEnd -= sliceLen;
+    if (selectedSlice >= sliceCount) selectedSlice = sliceCount - 1;
+    if (selectedSlice < 0) selectedSlice = 0;
+    selectSlice(selectedSlice);
+    syncMarkersToDs();
+    saveSliceState();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Cut Slice", 60);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Paste clipboard insert before selected slice, creating a new slice.
+ */
+function doSlicePasteInsert() {
+    if (!hasClipboard) { showStatus("Nothing to paste", 45); return; }
+    var oldTotal  = totalFrames;
+    var insertAt  = sliceBoundaries[selectedSlice];
+    startSample = insertAt;
+    endSample   = insertAt;
+    syncMarkersToDs();
+    host_module_get_param("dirty"); /* sync barrier: ensure markers are set before paste */
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("paste", "1", 5000);
+    } else {
+        host_module_set_param("paste", "1");
+        host_module_get_param("dirty"); /* sync barrier: wait for paste to complete */
+    }
+    refreshFileInfo();
+    refreshState();
+    var insertedFrames = totalFrames - oldTotal;
+    if (insertedFrames <= 0) { showStatus("Paste failed", 45); return; }
+    /* Shift existing boundaries from selectedSlice+1 onward, then insert new boundary */
+    for (var i = selectedSlice + 1; i < sliceBoundaries.length; i++) {
+        sliceBoundaries[i] += insertedFrames;
+    }
+    sliceBoundaries.splice(selectedSlice + 1, 0, insertAt + insertedFrames);
+    sliceCount     = sliceBoundaries.length - 1;
+    sliceRegionEnd += insertedFrames;
+    /* selectedSlice now points to the newly inserted slice */
+    selectSlice(selectedSlice);
+    syncMarkersToDs();
+    saveSliceState();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Inserted Slice " + (selectedSlice + 1), 60);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Move selected slice one position to the right (swap with next slice).
+ * Physically cuts slice i and re-inserts it after slice i+1.
+ * Net effect on boundaries: none. Only audio content is reordered.
+ */
+function doSliceMoveRight() {
+    if (selectedSlice >= sliceCount - 1) { showStatus("Last slice", 30); return; }
+    var sliceStart   = sliceBoundaries[selectedSlice];
+    var sliceEnd     = sliceBoundaries[selectedSlice + 1];
+    var nextEnd      = sliceBoundaries[selectedSlice + 2];
+    var insertPoint  = sliceStart + (nextEnd - sliceEnd); /* start + len of next slice */
+    startSample = sliceStart;
+    endSample   = sliceEnd;
+    syncMarkersToDs();
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("cut", "1", 5000);
+    } else {
+        host_module_set_param("cut", "1");
+        host_module_get_param("dirty"); /* sync barrier: wait for cut to complete */
+    }
+    hasClipboard = true;
+    refreshFileInfo();
+    startSample = insertPoint;
+    syncMarkersToDs();
+    host_module_get_param("dirty"); /* sync barrier: ensure markers are set before paste */
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("paste", "1", 5000);
+    } else {
+        host_module_set_param("paste", "1");
+        host_module_get_param("dirty"); /* sync barrier: wait for paste to complete */
+    }
+    refreshFileInfo();
+    refreshState();
+    selectedSlice++;
+    selectSlice(selectedSlice);
+    /* Adjust pad bank if needed */
+    if (selectedSlice >= slicePadOffset + 32) slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+    syncMarkersToDs();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Slice \u2192 " + (selectedSlice + 1), 30);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Move selected slice one position to the left (swap with previous slice).
+ * Physically cuts slice i and re-inserts it before slice i-1.
+ * Net effect on boundaries: none. Only audio content is reordered.
+ */
+function doSliceMoveLeft() {
+    if (selectedSlice <= 0) { showStatus("First slice", 30); return; }
+    var sliceStart   = sliceBoundaries[selectedSlice];
+    var sliceEnd     = sliceBoundaries[selectedSlice + 1];
+    var insertPoint  = sliceBoundaries[selectedSlice - 1]; /* before previous slice */
+    startSample = sliceStart;
+    endSample   = sliceEnd;
+    syncMarkersToDs();
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("cut", "1", 5000);
+    } else {
+        host_module_set_param("cut", "1");
+        host_module_get_param("dirty"); /* sync barrier: wait for cut to complete */
+    }
+    hasClipboard = true;
+    refreshFileInfo();
+    startSample = insertPoint;
+    syncMarkersToDs();
+    host_module_get_param("dirty"); /* sync barrier: ensure markers are set before paste */
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("paste", "1", 5000);
+    } else {
+        host_module_set_param("paste", "1");
+        host_module_get_param("dirty"); /* sync barrier: wait for paste to complete */
+    }
+    refreshFileInfo();
+    refreshState();
+    selectedSlice--;
+    selectSlice(selectedSlice);
+    /* Adjust pad bank if needed */
+    if (selectedSlice < slicePadOffset) slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+    syncMarkersToDs();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("\u2190 Slice " + (selectedSlice + 1), 30);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Shuffle all slices into a random order (Fisher-Yates).
+ * For each position i, picks a random source j >= i and moves it
+ * into place using repeated cut+paste (same mechanism as doSliceMoveLeft).
+ */
+function doSliceShuffle() {
+    if (sliceCount < 2) { showStatus("Need 2+ slices", 30); return; }
+    for (var i = 0; i < sliceCount - 1; i++) {
+        var j = i + Math.floor(Math.random() * (sliceCount - i));
+        /* Move slice j leftward to position i */
+        for (var k = j; k > i; k--) {
+            /* Cut slice at position k */
+            var sliceStart  = sliceBoundaries[k];
+            var sliceEnd    = sliceBoundaries[k + 1];
+            var insertPoint = sliceBoundaries[k - 1];
+            startSample = sliceStart;
+            endSample   = sliceEnd;
+            syncMarkersToDs();
+            if (typeof host_module_set_param_blocking === "function") {
+                host_module_set_param_blocking("cut", "1", 5000);
+            } else {
+                host_module_set_param("cut", "1");
+                host_module_get_param("dirty");
+            }
+            hasClipboard = true;
+            refreshFileInfo();
+            startSample = insertPoint;
+            syncMarkersToDs();
+            host_module_get_param("dirty");
+            if (typeof host_module_set_param_blocking === "function") {
+                host_module_set_param_blocking("paste", "1", 5000);
+            } else {
+                host_module_set_param("paste", "1");
+                host_module_get_param("dirty");
+            }
+            refreshFileInfo();
+        }
+    }
+    refreshState();
+    selectedSlice = 0;
+    selectSlice(0);
+    slicePadOffset = 0;
+    syncMarkersToDs();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Shuffled " + sliceCount + " slices", 60);
+    announce("Shuffled " + sliceCount + " slices");
 }
 
 /**
@@ -2792,6 +3284,19 @@ function doNormalize() {
     updateLeds();
 }
 
+/**
+ * Normalize selected region to -0.3dBFS.
+ */
+function doNormalizeSelection() {
+    host_module_set_param("normalize_selection", "1");
+    showStatus("Norm. Selection", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+
 /* ============ MIDI Input Handling ============ */
 
 /**
@@ -2810,7 +3315,7 @@ function handleCC(cc, value) {
     }
 
     /* Only handle presses (value > 0) for remaining CCs, except jog/encoders */
-    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4 || cc === CC_E5 || cc === CC_E7 || cc === CC_E8);
+    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4 || cc === CC_E5 || cc === CC_E6 || cc === CC_E7 || cc === CC_E8);
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
@@ -2858,6 +3363,11 @@ function handleCC(cc, value) {
             case VIEW_CONFIRM_NORMALIZE:
                 switchView(VIEW_TRIM);
                 break;
+            case VIEW_JOG_MENU:
+            case VIEW_JOG_SHIFT_MENU:
+            case VIEW_BPM_TRIM:
+                switchView(VIEW_TRIM);
+                break;
             case VIEW_CONFIRM_SAVE:
                 switchView(saveReturnView);
                 break;
@@ -2892,30 +3402,39 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Mute button — zero out selection */
+    /* Mute button — zero out selection (all views) */
     if (cc === CC_MUTE && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
             doMute();
-            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+        } else if (currentView === VIEW_LOOP) {
+            doMute();
+            invalidateSeamWaveform();
         }
         return;
     }
 
-    /* Delete button — cut selection to clipboard */
-    if (cc === CC_DELETE && value > 0) {
+
+    /* Undo button */
+    if (cc === CC_UNDO && value > 0) {
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            doCut();
+            doUndo();
             if (currentView === VIEW_LOOP) invalidateSeamWaveform();
         }
         return;
     }
 
-    /* Copy button: normal = copy to clipboard, shift = paste */
+    /* Copy button: copy (all views) / Shift+Copy: paste insert (all views) */
     if (cc === CC_COPY && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            if (shiftHeld) {
+        if (shiftHeld) {
+            if (currentView === VIEW_SLICE) {
+                doSlicePasteInsert();
+            } else {
                 doPaste();
                 if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+            }
+        } else {
+            if (currentView === VIEW_SLICE) {
+                doSliceCopy();
             } else {
                 doCopy();
             }
@@ -2923,11 +3442,15 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Undo button */
-    if (cc === CC_UNDO && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            doUndo();
-            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+    /* Remove (Delete) button: cut (all views) */
+    if (cc === CC_DELETE && value > 0) {
+        if (currentView === VIEW_SLICE) {
+            doSliceCut();
+        } else if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) {
+            doCut();
+        } else if (currentView === VIEW_LOOP) {
+            doCut();
+            invalidateSeamWaveform();
         }
         return;
     }
@@ -2947,6 +3470,12 @@ function handleCC(cc, value) {
                 /* Loop button in loop view: return to trim */
                 switchView(VIEW_TRIM);
             }
+        } else if (currentView === VIEW_BPM_TRIM) {
+            if (shiftHeld) {
+                /* Shift+Loop in BPM view: toggle loop on/off */
+                toggleLoop();
+            }
+            /* Plain Loop press does nothing in BPM view */
         } else if (currentView === VIEW_TRIM) {
             if (shiftHeld) {
                 /* Shift+Loop in trim view: toggle loop on/off */
@@ -2984,35 +3513,8 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Capture button — toggle between Trim and Slice mode.
-     * Shift+Capture: export selection to new file. */
+    /* Capture button */
     if (cc === CC_CAPTURE && value > 0) {
-        if (shiftHeld) {
-            if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_SLICE) {
-                doExport();
-            }
-        } else {
-            if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-                switchView(VIEW_SLICE);
-            } else if (currentView === VIEW_SLICE) {
-                if (lazyChopping) {
-                    stopPlayback();
-                    lazyChopping = false;
-                    announce("Chop stopped");
-                }
-                /* Restore loop state and selection spanning all slices */
-                if (savedLoopState) {
-                    loopEnabled = true;
-                    host_module_set_param("play_loop", "1");
-                }
-                startSample = sliceBoundaries[0];
-                endSample = sliceBoundaries[sliceCount];
-                syncMarkersToDs();
-                /* Clear persisted slice state — user explicitly left slice mode */
-                host_module_set_param("slice_state", "");
-                switchView(VIEW_TRIM);
-            }
-        }
         return;
     }
 
@@ -3042,7 +3544,28 @@ function handleCC(cc, value) {
 
     /* Left/Right arrows — nudge selection or jump by selection length */
     if ((cc === CC_LEFT || cc === CC_RIGHT) && value > 0) {
-        if (currentView === VIEW_TRIM) {
+        if (currentView === VIEW_BPM_TRIM) {
+            var dir = (cc === CC_LEFT) ? -1 : 1;
+            var beatStep = getBeatStepSamples();
+            if (shiftHeld) {
+                /* Shift: move entire selection by one beat division */
+                var selLen = endSample - startSample;
+                var newStart = startSample + dir * beatStep;
+                var newEnd   = endSample   + dir * beatStep;
+                if (newStart < 0) { newStart = 0; newEnd = selLen; }
+                if (newEnd > totalFrames) { newEnd = totalFrames; newStart = newEnd - selLen; if (newStart < 0) newStart = 0; }
+                startSample = newStart;
+                endSample   = newEnd;
+                showStatus("Start:" + formatTime(startSample), 30);
+            } else {
+                /* Normal: move selected marker by one beat division */
+                adjustMarker(selectedField, dir * beatStep);
+                showStatus((selectedField === 0 ? "Start:" : "End:") + formatTime(selectedField === 0 ? startSample : endSample), 30);
+            }
+            syncMarkersToDs();
+            refreshWaveform();
+            return;
+        } else if (currentView === VIEW_TRIM) {
             var selLen = endSample - startSample;
             var dir = (cc === CC_LEFT) ? -1 : 1;
 
@@ -3088,27 +3611,72 @@ function handleCC(cc, value) {
             refreshWaveform();
             announce("Start:" + formatTime(startSample));
         } else if (currentView === VIEW_SLICE) {
-            /* Left/Right: select prev/next slice (wraps) */
-            var sliceDir = (cc === CC_LEFT) ? -1 : 1;
-            var newIdx = selectedSlice + sliceDir;
-            if (newIdx < 0) newIdx = sliceCount - 1;
-            if (newIdx >= sliceCount) newIdx = 0;
-            selectSlice(newIdx);
-            /* Auto-scroll pad bank if selected slice is outside visible range */
-            if (selectedSlice < slicePadOffset) {
-                slicePadOffset = Math.floor(selectedSlice / 32) * 32;
-            } else if (selectedSlice >= slicePadOffset + 32) {
-                slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+            if (shiftHeld) {
+                /* Shift+Left/Right: move selected slice one position (swap with neighbour) */
+                if (cc === CC_LEFT) {
+                    doSliceMoveLeft();
+                } else {
+                    doSliceMoveRight();
+                }
+            } else {
+                /* Left/Right: select prev/next slice (wraps) */
+                var sliceDir = (cc === CC_LEFT) ? -1 : 1;
+                var newIdx = selectedSlice + sliceDir;
+                if (newIdx < 0) newIdx = sliceCount - 1;
+                if (newIdx >= sliceCount) newIdx = 0;
+                selectSlice(newIdx);
+                /* Auto-scroll pad bank if selected slice is outside visible range */
+                if (selectedSlice < slicePadOffset) {
+                    slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+                } else if (selectedSlice >= slicePadOffset + 32) {
+                    slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+                }
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
             }
-            syncMarkersToDs();
-            updateSlicePadLeds();
-            announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
         }
         return;
     }
 
-    /* Up/Down arrows in slice mode */
+    /* Up/Down arrows */
     if ((cc === CC_UP || cc === CC_DOWN) && value > 0) {
+        if (currentView === VIEW_BPM_TRIM) {
+            if (cc === CC_DOWN) {
+                /* Down: read BPM from filename */
+                var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
+                if (bpmMatch) {
+                    var detectedBpm = parseFloat(bpmMatch[1]);
+                    if (detectedBpm >= 20 && detectedBpm <= 999) {
+                        bpm = Math.round(detectedBpm * 10) / 10;
+                        var beatStep = getBeatStepSamples();
+                        var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
+                        endSample = startSample + beats * beatStep;
+                        if (endSample > totalFrames) endSample = totalFrames;
+                        syncMarkersToDs();
+                        refreshWaveform();
+                        showStatus("BPM: " + bpm.toFixed(1), 90);
+                    } else {
+                        showStatus("BPM out of range", 60);
+                    }
+                } else {
+                    showStatus("No BPM in filename", 60);
+                }
+            } else {
+                /* Up: estimate BPM from selection length */
+                var selLen = endSample - startSample;
+                if (selLen <= 0) { showStatus("Empty selection", 60); return; }
+                var div = BEAT_DIVISIONS[beatDivIndex];
+                var estimatedBpm = 960.0 / (selLen / sampleRate * div);
+                estimatedBpm = Math.round(estimatedBpm * 10) / 10;
+                if (estimatedBpm < 20 || estimatedBpm > 999) {
+                    showStatus("BPM out of range", 60); return;
+                }
+                bpm = estimatedBpm;
+                showStatus("BPM: " + bpm.toFixed(1), 90);
+            }
+            return;
+        }
         if (currentView === VIEW_SLICE) {
             if (shiftHeld && sliceCount > 32) {
                 /* Shift+Up/Down: pad bank scrolling (>32 slices) */
@@ -3196,10 +3764,21 @@ function handleCC(cc, value) {
                 break;
 
             case VIEW_TRIM:
-                /* Adjust selected marker: shift = 1 sample, normal = coarse */
-                adjustMarker(selectedField, shiftHeld ? delta : delta * getCoarseStep());
-                showJogStatus((selectedField === 0 ? "Start:" : "End:") + formatTime(selectedField === 0 ? startSample : endSample));
-                refreshWaveform();
+                if (zoomLevel > 0) {
+                    /* Zoomed in: scroll viewport. Shift = fine (1px), normal = 1/8 view */
+                    var scrollStep = shiftHeld
+                        ? Math.max(1, Math.floor(getVisibleSamples() / SCREEN_W))
+                        : Math.max(1, Math.floor(getVisibleSamples() / 8));
+                    zoomCenter += delta * scrollStep;
+                    /* Clamp so the visible window stays within file boundaries */
+                    var visHalf = Math.floor(getVisibleSamples() / 2);
+                    if (zoomCenter < visHalf) zoomCenter = visHalf;
+                    if (zoomCenter > totalFrames - visHalf) zoomCenter = totalFrames - visHalf;
+                    refreshWaveform();
+                    showJogStatus("Pos:" + formatTime(getVisibleStart()));
+                } else {
+                    showStatus("Nothing to pan", 30);
+                }
                 break;
 
             case VIEW_LOOP:
@@ -3209,91 +3788,61 @@ function handleCC(cc, value) {
                 showJogStatus(loopSelectedField === 0 ? "Pt:" + formatTime(startSample) : "End:" + formatTime(endSample));
                 break;
 
-            case VIEW_SLICE:
-                if (lazyChopping) break; /* No jog edits while chopping */
-                if (sliceMenuEditing) {
-                    /* Editing the focused parameter */
-                    if (sliceMenuIndex === 0) {
-                        /* Toggle mode */
-                        /* Cycle: Even -> Auto -> Lazy -> Even */
-                        if (delta > 0) {
-                            if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_AUTO;
-                            else if (sliceMode === SLICE_MODE_AUTO) sliceMode = SLICE_MODE_LAZY;
-                            else sliceMode = SLICE_MODE_EVEN;
-                        } else {
-                            if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_LAZY;
-                            else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_AUTO;
-                            else sliceMode = SLICE_MODE_EVEN;
-                        }
-                        if (sliceMode === SLICE_MODE_LAZY) {
-                            lazySub = LAZY_SUB_CHOP;
-                            lazyChopping = false;
-                        }
-                        /* Reset to full region when switching modes */
-                        sliceCount = 1;
-                        selectedSlice = 0;
-                        sliceBoundaries = [];
-                        slicePadOffset = 0;
-                        recomputeSliceBoundaries();
-                        selectSlice(0);
-                        syncMarkersToDs();
-                        updateSlicePadLeds();
-                        var modeAnnounce = sliceMode === SLICE_MODE_LAZY ? "Lazy, press Pad 1" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Even");
-                        announce(modeAnnounce);
-                    } else if (sliceMenuIndex === 1) {
-                        if (sliceMode === SLICE_MODE_LAZY) {
-                            /* Toggle Chop / Play sub-mode */
-                            lazySub = (lazySub === LAZY_SUB_CHOP) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
-                            lazyChopping = false;
-                            updateSlicePadLeds();
-                            announce(lazySub === LAZY_SUB_CHOP ? "Chop, press Pad 1" : "Play");
-                        } else if (sliceMode === SLICE_MODE_EVEN) {
-                            /* Adjust slice count */
-                            sliceCount += (delta > 0 ? 1 : -1);
-                            if (sliceCount < 1) sliceCount = 1;
-                            if (sliceCount > 128) sliceCount = 128;
-                            recomputeSliceBoundaries();
-                            selectSlice(selectedSlice);
-                            syncMarkersToDs();
-                            updateSlicePadLeds();
-                            announce("Slices:" + sliceCount);
-                        } else {
-                            /* Adjust auto threshold (jog = fine 0.1 steps) */
-                            sliceThreshold += delta * 0.1;
-                            sliceThreshold = Math.round(sliceThreshold * 10) / 10;
-                            if (sliceThreshold < 0.1) sliceThreshold = 0.1;
-                            if (sliceThreshold > 100) sliceThreshold = 100;
-                            recomputeSliceBoundaries();
-                            selectSlice(selectedSlice);
-                            syncMarkersToDs();
-                            updateSlicePadLeds();
-                            announce("Thresh:" + sliceThreshold.toFixed(1));
-                        }
-                    } else if (sliceMenuIndex === 2) {
-                        /* Cycle selected slice */
-                        var newIdx = selectedSlice + (delta > 0 ? 1 : -1);
-                        if (newIdx < 0) newIdx = sliceCount - 1;
-                        if (newIdx >= sliceCount) newIdx = 0;
-                        selectSlice(newIdx);
-                        /* Auto-scroll pad bank */
-                        if (selectedSlice < slicePadOffset) {
-                            slicePadOffset = Math.floor(selectedSlice / 32) * 32;
-                        } else if (selectedSlice >= slicePadOffset + 32) {
-                            slicePadOffset = Math.floor(selectedSlice / 32) * 32;
-                        }
-                        syncMarkersToDs();
-                        updateSlicePadLeds();
-                        announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
-                    }
+            case VIEW_JOG_MENU:
+                jogMenuIndex += delta;
+                if (jogMenuIndex < 0) jogMenuIndex = 0;
+                if (jogMenuIndex >= jogMenuItems.length) jogMenuIndex = jogMenuItems.length - 1;
+                if (jogMenuIndex < jogMenuScrollOffset) jogMenuScrollOffset = jogMenuIndex;
+                if (jogMenuIndex >= jogMenuScrollOffset + JOG_MENU_VISIBLE) jogMenuScrollOffset = jogMenuIndex - JOG_MENU_VISIBLE + 1;
+                announce(jogMenuItems[jogMenuIndex]);
+                break;
+
+            case VIEW_JOG_SHIFT_MENU:
+                jogShiftMenuIndex += delta;
+                if (jogShiftMenuIndex < 0) jogShiftMenuIndex = 0;
+                if (jogShiftMenuIndex >= jogShiftMenuItems.length) jogShiftMenuIndex = jogShiftMenuItems.length - 1;
+                announce(jogShiftMenuItems[jogShiftMenuIndex]);
+                break;
+
+            case VIEW_BPM_TRIM:
+                /* Jog scrolls viewport (same as VIEW_TRIM when zoomed) */
+                if (zoomLevel > 0) {
+                    var scrollStep = shiftHeld
+                        ? Math.max(1, Math.floor(getVisibleSamples() / SCREEN_W))
+                        : Math.max(1, Math.floor(getVisibleSamples() / 8));
+                    zoomCenter += delta * scrollStep;
+                    var visHalf2 = Math.floor(getVisibleSamples() / 2);
+                    if (zoomCenter < visHalf2) zoomCenter = visHalf2;
+                    if (zoomCenter > totalFrames - visHalf2) zoomCenter = totalFrames - visHalf2;
+                    refreshWaveform();
+                    showJogStatus("Pos:" + formatTime(getVisibleStart()));
                 } else {
-                    /* Navigate between menu items */
-                    sliceMenuIndex += (delta > 0 ? 1 : -1);
-                    if (sliceMenuIndex < 0) sliceMenuIndex = 0;
-                    if (sliceMenuIndex > 2) sliceMenuIndex = 2;
-                    var param2Name = sliceMode === SLICE_MODE_LAZY ? "Sub-mode" : (sliceMode === SLICE_MODE_EVEN ? "Count" : "Thresh");
-                    var itemNames = ["Mode", param2Name, "Select"];
-                    announce(itemNames[sliceMenuIndex]);
+                    showStatus("Nothing to pan", 30);
                 }
+                break;
+
+            case VIEW_SLICE:
+                if (lazyChopping) break; /* No jog while chopping */
+                /* Jog cycles through modes: Even -> Auto -> Lazy -> BPM -> Even */
+                if (delta > 0) {
+                    if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_AUTO;
+                    else if (sliceMode === SLICE_MODE_AUTO) sliceMode = SLICE_MODE_LAZY;
+                    else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_BPM;
+                    else sliceMode = SLICE_MODE_EVEN;
+                } else {
+                    if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_BPM;
+                    else if (sliceMode === SLICE_MODE_BPM) sliceMode = SLICE_MODE_LAZY;
+                    else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_AUTO;
+                    else sliceMode = SLICE_MODE_EVEN;
+                }
+                if (sliceMode === SLICE_MODE_LAZY) { lazySub = LAZY_SUB_CHOP; lazyChopping = false; }
+                sliceCount = 1; selectedSlice = 0; sliceBoundaries = []; slicePadOffset = 0;
+                recomputeSliceBoundaries();
+                selectSlice(0);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                var modeNames = ["Even", "Auto", "Lazy", "BPM"];
+                announce(modeNames[sliceMode] || "Even");
                 break;
         }
         return;
@@ -3319,9 +3868,40 @@ function handleCC(cc, value) {
                 break;
 
             case VIEW_TRIM:
-                /* Toggle selected field */
+                if (shiftHeld) {
+                    jogShiftMenuIndex = 0;
+                    switchView(VIEW_JOG_SHIFT_MENU);
+                } else {
+                    jogMenuIndex = 0;
+                    jogMenuScrollOffset = 0;
+                    switchView(VIEW_JOG_MENU);
+                }
+                break;
+
+            case VIEW_JOG_MENU:
+                switch (jogMenuIndex) {
+                    case 0: doCopy(); break;
+                    case 1: doCut(); break;
+                    case 2: doMute(); break;
+                    case 3: doTrim(); break;
+                    case 4: doNormalizeSelection(); break;
+                }
+                switchView(VIEW_TRIM);
+                break;
+
+            case VIEW_BPM_TRIM:
+                /* Jog click: toggle start/end marker */
                 selectedField = selectedField === 0 ? 1 : 0;
                 showStatus(selectedField === 0 ? "Start" : "End", 30);
+                break;
+
+            case VIEW_JOG_SHIFT_MENU:
+                switch (jogShiftMenuIndex) {
+                    case 0: doPaste(); break;
+                    case 1: doPasteOverwrite(); break;
+                    case 2: doExport(); break;
+                }
+                switchView(VIEW_TRIM);
                 break;
 
             case VIEW_LOOP:
@@ -3330,17 +3910,6 @@ function handleCC(cc, value) {
                 showStatus(loopSelectedField === 0 ? "Loop Point" : "Loop End", 30);
                 break;
 
-            case VIEW_SLICE:
-                /* Toggle editing of current menu item */
-                sliceMenuEditing = !sliceMenuEditing;
-                if (sliceMenuEditing) {
-                    var edit2Name = sliceMode === SLICE_MODE_LAZY ? "Sub-mode" : (sliceMode === SLICE_MODE_EVEN ? "Count" : "Threshold");
-                    var editNames = ["Editing Mode", "Editing " + edit2Name, "Editing Slice"];
-                    announce(editNames[sliceMenuIndex]);
-                } else {
-                    announce("Navigate");
-                }
-                break;
 
             case VIEW_OPEN_FILE:
                 if (openFileBrowserState) {
@@ -3382,7 +3951,12 @@ function handleCC(cc, value) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM) {
+        if (currentView === VIEW_BPM_TRIM) {
+            var step = shiftHeld ? 1 : getBeatStepSamples();
+            adjustMarker(0, delta * step);
+            showKnobStatus(0, "Start:" + formatTime(startSample));
+            refreshWaveform();
+        } else if (currentView === VIEW_TRIM) {
             var step = shiftHeld ? 1 : getCoarseStep();
             adjustMarker(0, delta * step);
             showKnobStatus(0, shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample));
@@ -3430,7 +4004,12 @@ function handleCC(cc, value) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM) {
+        if (currentView === VIEW_BPM_TRIM) {
+            var step = shiftHeld ? 1 : getBeatStepSamples();
+            adjustMarker(1, delta * step);
+            showKnobStatus(1, "End:" + formatTime(endSample));
+            refreshWaveform();
+        } else if (currentView === VIEW_TRIM) {
             var step = shiftHeld ? 1 : getCoarseStep();
             adjustMarker(1, delta * step);
             showKnobStatus(1, shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample));
@@ -3478,7 +4057,7 @@ function handleCC(cc, value) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM || currentView === VIEW_SLICE) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
             var wasZero = (zoomLevel <= 0);
             zoomLevel += delta * ZOOM_STEP;
             if (zoomLevel < 0) zoomLevel = 0;
@@ -3520,19 +4099,62 @@ function handleCC(cc, value) {
 
     /* E5 turn: gain (trim/loop) | threshold (slice auto) | Shift+E5: normalize */
     if (cc === CC_E5) {
-        if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_AUTO) {
+        if (currentView === VIEW_BPM_TRIM) {
             var delta = decodeDelta(value);
             if (delta === 0) return;
-            var step = shiftHeld ? 0.1 : 1.0;
-            sliceThreshold += delta * step;
-            sliceThreshold = Math.round(sliceThreshold * 10) / 10;
-            if (sliceThreshold < 0.1) sliceThreshold = 0.1;
-            if (sliceThreshold > 100) sliceThreshold = 100;
-            recomputeSliceBoundaries();
-            selectSlice(selectedSlice);
+            bpm += delta * (shiftHeld ? 0.1 : 1.0);
+            if (bpm < 20) bpm = 20;
+            if (bpm > 999) bpm = 999;
+            bpm = Math.round(bpm * 10) / 10;
+            /* Snap end marker so selection stays a multiple of one beat division */
+            var beatStep = getBeatStepSamples();
+            var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
+            endSample = startSample + beats * beatStep;
+            if (endSample > totalFrames) endSample = totalFrames;
             syncMarkersToDs();
-            updateSlicePadLeds();
-            showKnobStatus(4, "T:" + sliceThreshold.toFixed(1));
+            refreshWaveform();
+            showKnobStatus(4, "BPM:" + bpm.toFixed(1));
+            return;
+        }
+        if (currentView === VIEW_SLICE && !lazyChopping) {
+            var delta = decodeDelta(value);
+            if (delta === 0) return;
+            if (sliceMode === SLICE_MODE_BPM) {
+                bpm += delta * (shiftHeld ? 0.1 : 1.0);
+                if (bpm < 20) bpm = 20;
+                if (bpm > 999) bpm = 999;
+                bpm = Math.round(bpm * 10) / 10;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(4, "BPM:" + bpm.toFixed(1));
+            } else if (sliceMode === SLICE_MODE_EVEN) {
+                sliceCount += (delta > 0 ? 1 : -1);
+                if (sliceCount < 1) sliceCount = 1;
+                if (sliceCount > 128) sliceCount = 128;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(4, "Count:" + sliceCount);
+            } else if (sliceMode === SLICE_MODE_AUTO) {
+                var step = shiftHeld ? 0.1 : 1.0;
+                sliceThreshold += delta * step;
+                sliceThreshold = Math.round(sliceThreshold * 10) / 10;
+                if (sliceThreshold < 0.1) sliceThreshold = 0.1;
+                if (sliceThreshold > 100) sliceThreshold = 100;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(4, "T:" + sliceThreshold.toFixed(1));
+            } else if (sliceMode === SLICE_MODE_LAZY) {
+                lazySub = (lazySub === LAZY_SUB_CHOP) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
+                lazyChopping = false;
+                updateSlicePadLeds();
+                showKnobStatus(4, lazySub === LAZY_SUB_CHOP ? "Chop" : "Play");
+            }
             return;
         }
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
@@ -3552,6 +4174,43 @@ function handleCC(cc, value) {
             }
         }
         return;
+    }
+
+    /* E6 (Knob 6): Division in VIEW_BPM_TRIM and VIEW_SLICE (BPM mode) */
+    if (cc === CC_E6) {
+        var delta = decodeDelta(value);
+        if (delta !== 0) {
+            if (currentView === VIEW_BPM_TRIM ||
+                (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_BPM && !lazyChopping)) {
+                beatDivIndex += (delta > 0 ? 1 : -1);
+                if (beatDivIndex < 0) beatDivIndex = 0;
+                if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                if (currentView === VIEW_SLICE) {
+                    recomputeSliceBoundaries();
+                    selectSlice(selectedSlice);
+                    syncMarkersToDs();
+                    updateSlicePadLeds();
+                }
+                showKnobStatus(5, "Div:" + BEAT_DIVISION_LABELS[beatDivIndex]);
+                return;
+            }
+        }
+        return; /* E6 has no function in other views */
+    }
+
+    /* E8 (Knob 8): Slice select in VIEW_SLICE */
+    if (cc === CC_E8) {
+        var delta = decodeDelta(value);
+        if (delta !== 0 && currentView === VIEW_SLICE && !lazyChopping) {
+            var newIdx = selectedSlice + (delta > 0 ? 1 : -1);
+            if (newIdx < 0) newIdx = 0;
+            if (newIdx >= sliceCount) newIdx = sliceCount - 1;
+            selectSlice(newIdx);
+            syncMarkersToDs();
+            updateSlicePadLeds();
+            showKnobStatus(7, "Slice " + (selectedSlice + 1) + "/" + sliceCount);
+            return;
+        }
     }
 
     /* E7/E8 twist actions: turn confirms/cancels pending action */
@@ -3602,18 +4261,85 @@ function handleNote(note, velocity) {
         }
     }
 
+    /* Step 9/10: fade in/out (Trim/BPM/Slice) */
+    if (velocity > 0 && (note === STEP_BASE + 8 || note === STEP_BASE + 9)) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
+            if (note === STEP_BASE + 8) {
+                doFadeIn();
+            } else {
+                doFadeOut();
+            }
+            return;
+        }
+    }
+
+    /* Step 16: shuffle slices (Slice view only) */
+    if (velocity > 0 && note === STEP_BASE + 15 && currentView === VIEW_SLICE) {
+        doSliceShuffle();
+        return;
+    }
+
+    /* Step 15/16: set start/end marker at playback position */
+    if (velocity > 0 && (note === STEP_BASE + 14 || note === STEP_BASE + 15)) {
+        if ((currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) && playing) {
+            if (note === STEP_BASE + 14) {
+                /* Step 15: set start marker at play position */
+                startSample = playPos;
+                if (startSample >= endSample) endSample = startSample + 1;
+                if (endSample > totalFrames) { endSample = totalFrames; startSample = endSample - 1; }
+                syncMarkersToDs();
+                refreshWaveform();
+                showStatus("Start \u2192 " + formatTime(startSample), 60);
+            } else {
+                /* Step 16: set end marker at play position */
+                endSample = playPos;
+                if (endSample <= startSample) endSample = startSample + 1;
+                if (endSample > totalFrames) endSample = totalFrames;
+                syncMarkersToDs();
+                refreshWaveform();
+                showStatus("End \u2192 " + formatTime(endSample), 60);
+            }
+        }
+        return;
+    }
+
+    /* Step 1–3: view switcher (VIEW_TRIM / VIEW_BPM_TRIM / VIEW_SLICE) */
+    if (velocity > 0 && note >= STEP_BASE && note <= STEP_BASE + 2) {
+        var editViews = [VIEW_TRIM, VIEW_BPM_TRIM, VIEW_SLICE, VIEW_LOOP];
+        if (editViews.indexOf(currentView) >= 0) {
+            var targetView = [VIEW_TRIM, VIEW_BPM_TRIM, VIEW_SLICE][note - STEP_BASE];
+            if (currentView !== targetView) {
+                /* Leaving slice mode: restore loop state and clear persisted slice state */
+                if (currentView === VIEW_SLICE) {
+                    stopPlayback();
+                    if (savedLoopState) {
+                        loopEnabled = true;
+                        host_module_set_param("play_loop", "1");
+                    }
+                    startSample = sliceBoundaries[0];
+                    endSample = sliceBoundaries[sliceCount];
+                    playPos = startSample;
+                    host_module_set_param("slice_state", "");
+                    syncMarkersToDs();
+                }
+                switchView(targetView);
+            }
+        }
+        return;
+    }
+
     /* Pad press/release: audition (hold to play, release to stop).
      * Only the most recently pressed pad owns playback — releasing
      * an earlier pad while a newer one is held does nothing. */
     if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_BPM_TRIM) {
             if (velocity > 0) {
                 setLED(note, PAD_COLOR_PLAY);
                 activePadNote = note;
                 if (shiftHeld) {
-                    /* Shift+pad: preview from 3% before end marker */
+                    /* Shift+pad: preview from before end marker (~20% of selection) */
                     var selLen = endSample - startSample;
-                    var previewLen = Math.min(Math.max(Math.floor(selLen * 0.05), Math.floor(sampleRate / 4)), sampleRate * 5);
+                    var previewLen = Math.min(Math.max(Math.floor(selLen * 0.20), sampleRate), sampleRate * 20);
                     var from = endSample - previewLen;
                     if (from < startSample) from = startSample;
                     startPlaybackFrom(from);
@@ -3804,6 +4530,7 @@ globalThis.tick = function() {
         if (!ledInitPending) {
             /* Init just finished — sync LEDs to current state */
             updateLeds();
+            if (currentView === VIEW_SLICE) updateSlicePadLeds();
         }
     }
 
@@ -3928,6 +4655,15 @@ globalThis.tick = function() {
             break;
         case VIEW_SLICE:
             drawSliceView();
+            break;
+        case VIEW_JOG_MENU:
+            drawJogMenu();
+            break;
+        case VIEW_JOG_SHIFT_MENU:
+            drawJogShiftMenu();
+            break;
+        case VIEW_BPM_TRIM:
+            drawBpmTrim();
             break;
     }
 };

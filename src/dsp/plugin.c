@@ -1205,6 +1205,86 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(key, "fade_in") == 0) {
+        /* Linear fade-in over selection */
+        if (!inst->audio_data || inst->audio_frames <= 0) return;
+
+        int start = inst->start_sample;
+        int end   = inst->end_sample;
+        if (start < 0) start = 0;
+        if (end > inst->audio_frames) end = inst->audio_frames;
+        if (start >= end) {
+            plugin_log("Fade in: invalid selection");
+            return;
+        }
+
+        save_undo(inst);
+
+        int len = end - start;
+        for (int i = 0; i < len; i++) {
+            float gain = (float)i / (float)len;
+            int idx = (start + i) * SAMPLES_PER_FRAME;
+            for (int ch = 0; ch < SAMPLES_PER_FRAME; ch++) {
+                float s = (float)inst->audio_data[idx + ch] * gain;
+                if (s > 32767.0f) s = 32767.0f;
+                if (s < -32768.0f) s = -32768.0f;
+                inst->audio_data[idx + ch] = (int16_t)s;
+            }
+        }
+
+        inst->dirty = 1;
+        compute_waveform(inst, 128);
+        inst->peak_db = compute_peak_db(inst->audio_data, inst->audio_frames);
+
+        {
+            char log_buf[128];
+            snprintf(log_buf, sizeof(log_buf),
+                     "Fade in %d-%d (%d frames)", start, end, len);
+            plugin_log(log_buf);
+        }
+        return;
+    }
+
+    if (strcmp(key, "fade_out") == 0) {
+        /* Linear fade-out over selection */
+        if (!inst->audio_data || inst->audio_frames <= 0) return;
+
+        int start = inst->start_sample;
+        int end   = inst->end_sample;
+        if (start < 0) start = 0;
+        if (end > inst->audio_frames) end = inst->audio_frames;
+        if (start >= end) {
+            plugin_log("Fade out: invalid selection");
+            return;
+        }
+
+        save_undo(inst);
+
+        int len = end - start;
+        for (int i = 0; i < len; i++) {
+            float gain = 1.0f - (float)i / (float)len;
+            int idx = (start + i) * SAMPLES_PER_FRAME;
+            for (int ch = 0; ch < SAMPLES_PER_FRAME; ch++) {
+                float s = (float)inst->audio_data[idx + ch] * gain;
+                if (s > 32767.0f) s = 32767.0f;
+                if (s < -32768.0f) s = -32768.0f;
+                inst->audio_data[idx + ch] = (int16_t)s;
+            }
+        }
+
+        inst->dirty = 1;
+        compute_waveform(inst, 128);
+        inst->peak_db = compute_peak_db(inst->audio_data, inst->audio_frames);
+
+        {
+            char log_buf[128];
+            snprintf(log_buf, sizeof(log_buf),
+                     "Fade out %d-%d (%d frames)", start, end, len);
+            plugin_log(log_buf);
+        }
+        return;
+    }
+
     if (strcmp(key, "cut") == 0) {
         /* Cut selection to clipboard (copy + remove) */
         if (!inst->audio_data || inst->audio_frames <= 0) return;
@@ -1431,6 +1511,93 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             snprintf(log_buf, sizeof(log_buf),
                      "Normalized: applied %.1f dB, peak now %.1f dB",
                      gain_needed_db, inst->peak_db);
+            plugin_log(log_buf);
+        }
+        return;
+    }
+
+    if (strcmp(key, "normalize_selection") == 0) {
+        /* Normalize only the selected region [start_sample, end_sample] to target dBFS */
+        if (!inst->audio_data || inst->audio_frames <= 0) return;
+
+        /* Clamp selection to valid frame range */
+        int start = inst->start_sample;
+        int end   = inst->end_sample;
+        if (start < 0) start = 0;
+        if (end > inst->audio_frames) end = inst->audio_frames;
+        if (start >= end) {
+            plugin_log("NormalizeSel: empty selection");
+            return;
+        }
+
+        save_undo(inst);
+
+        /* Find peak within selection */
+        float current_peak_db = compute_peak_db(inst->audio_data + start * SAMPLES_PER_FRAME,
+                                                end - start);
+        if (current_peak_db <= -96.0f) {
+            plugin_log("NormalizeSel: selection is silent");
+            return;
+        }
+
+        /* Calculate gain needed to reach target */
+        float gain_needed_db = NORMALIZE_TARGET_DB - current_peak_db;
+        float linear_gain    = powf(10.0f, gain_needed_db / 20.0f);
+        int   total_samples  = (end - start) * SAMPLES_PER_FRAME;
+        int16_t *ptr         = inst->audio_data + start * SAMPLES_PER_FRAME;
+
+        for (int i = 0; i < total_samples; i++) {
+            float s = (float)ptr[i] * linear_gain;
+            if (s > 32767.0f) s = 32767.0f;
+            if (s < -32768.0f) s = -32768.0f;
+            ptr[i] = (int16_t)s;
+        }
+
+        inst->dirty = 1;
+        inst->peak_db = compute_peak_db(inst->audio_data, inst->audio_frames);
+        compute_waveform(inst, 128);
+
+        {
+            char log_buf[128];
+            snprintf(log_buf, sizeof(log_buf),
+                     "NormalizeSel: applied %.1f dB, peak now %.1f dB",
+                     gain_needed_db, inst->peak_db);
+            plugin_log(log_buf);
+        }
+        return;
+    }
+
+    if (strcmp(key, "paste_overwrite") == 0) {
+        /* Paste clipboard at start_sample, overwriting (file length unchanged) */
+        if (!inst->clipboard_data || inst->clipboard_frames <= 0) {
+            plugin_log("PasteOW: clipboard empty"); return; }
+        if (!inst->audio_data || inst->audio_frames <= 0) return;
+
+        int insert_at = inst->start_sample;
+        if (insert_at < 0) insert_at = 0;
+        if (insert_at >= inst->audio_frames) {
+            plugin_log("PasteOW: cursor at/past EOF"); return; }
+
+        int frames_to_write = inst->clipboard_frames;
+        if (insert_at + frames_to_write > inst->audio_frames)
+            frames_to_write = inst->audio_frames - insert_at;
+
+        save_undo(inst);
+
+        memcpy(inst->audio_data + insert_at * SAMPLES_PER_FRAME,
+               inst->clipboard_data,
+               (size_t)frames_to_write * SAMPLES_PER_FRAME * sizeof(int16_t));
+
+        inst->start_sample = insert_at;
+        inst->end_sample   = insert_at + frames_to_write;
+        inst->dirty   = 1;
+        inst->playing = 0;
+        compute_waveform(inst, 128);
+        inst->peak_db = compute_peak_db(inst->audio_data, inst->audio_frames);
+        {
+            char log_buf[128];
+            snprintf(log_buf, sizeof(log_buf),
+                     "PasteOW: wrote %d frames at %d", frames_to_write, insert_at);
             plugin_log(log_buf);
         }
         return;
